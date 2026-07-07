@@ -1,0 +1,10 @@
+[package]
+name = "netnet"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.103"
+chrono = "0.4.45"
+log = "0.4.33"
+wincode = { version = "0.5.5", features = ["derive"] }
