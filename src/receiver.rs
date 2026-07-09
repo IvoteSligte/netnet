@@ -5,46 +5,57 @@ use std::{
     net::UdpSocket,
     sync::{Arc, Mutex},
 };
-use wincode::{SchemaReadOwned, config::DefaultConfig};
 
 use crate::*;
 
-fn spawn_receiver_thread(socket: UdpSocket, receiver: Arc<Mutex<Receiver>>) {
+use crate::Error::Stopped;
+
+type Queue = Arc<Mutex<VecDeque<(MessageHeader, Vec<u8>)>>>;
+
+fn spawn_receiver_thread(socket: UdpSocket, stop: Signal, queue: Queue) {
+    socket.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     std::thread::spawn(move || {
         let mut buf = vec![0u8; MAX_MESSAGE_SIZE];
-        loop {
-            socket.recv(&mut buf).unwrap();
-            let receiver = &mut *receiver.lock().unwrap();
-            let (header, body_bytes) = split_message(&buf);
-            if receiver.queue.len() >= RECV_BUFFER_CAP {
+        while !stop.get() {
+            let num_bytes = match socket.recv(&mut buf) {
+                Ok(n) => n,
+                Err(err)
+                    if err.kind() == io::ErrorKind::TimedOut
+                        || err.kind() == io::ErrorKind::WouldBlock =>
+                {
+                    continue;
+                }
+                Err(err) => panic!("Failed to read from socket: {err}"),
+            };
+            let queue = &mut *queue.lock().unwrap();
+            let (header, body_bytes) = split_message(&buf[..num_bytes]);
+            if queue.len() >= RECV_BUFFER_CAP {
                 // remove oldest message
-                receiver.queue.pop_front();
-                receiver.survival_rate.update(0.0);
+                queue.pop_front();
                 trace!(
-                    "Dropped message {} of packet {} due to full buffer ({:.0}% survival rate)",
-                    header.message_id,
-                    header.packet_id,
-                    receiver.survival_rate.get() * 100.0
+                    "Dropped message {} of packet {} due to full message buffer",
+                    header.message_id, header.packet_id,
                 );
             }
             let mut index = 0;
-            for (h, _) in &receiver.queue {
+            for (h, _) in queue.iter() {
                 if h.packet_timestamp >= header.packet_timestamp {
                     break;
                 }
                 index += 1;
             }
-            receiver.queue.insert(index, (header, body_bytes.to_vec()));
+            queue.insert(index, (header, body_bytes.to_vec()));
         }
     });
 }
 
 pub struct Receiver {
-    /// Survival rate of messages received (equal to 1.0 - drop_rate)
-    survival_rate: RunningAverage,
+    stop: Signal,
     /// Fixed-size queue of received messages, sorted by timestamp
     /// (header, body_bytes)
-    queue: VecDeque<(MessageHeader, Vec<u8>)>,
+    queue: Arc<Mutex<VecDeque<(MessageHeader, Vec<u8>)>>>,
+    /// Packets with latency greater than this value are dropped
+    max_latency_ms: f32,
     /// Sorted by timestamp
     packet_map: VecDeque<PacketInfo>,
     /// ID of the last complete packet received
@@ -54,23 +65,36 @@ pub struct Receiver {
 }
 
 impl Receiver {
-    pub fn new(socket: UdpSocket) -> Arc<Mutex<Self>> {
-        let receiver = Arc::new(Mutex::new(Receiver {
-            survival_rate: RunningAverage::new(10000.0),
-            queue: VecDeque::with_capacity(RECV_BUFFER_CAP),
+    pub fn new(socket: UdpSocket, stop: Signal, max_latency: Duration) -> Self {
+        let queue = Arc::new(Mutex::new(VecDeque::with_capacity(RECV_BUFFER_CAP)));
+        let receiver = Receiver {
+            stop: stop.clone(),
+            queue: queue.clone(),
+            max_latency_ms: max_latency.as_micros() as f32 / 1000.0,
             packet_map: VecDeque::with_capacity(PACKET_MAP_CAP),
             last_packet_id: 0,
             last_packet_timestamp: 0,
-        }));
-        spawn_receiver_thread(socket, receiver.clone());
+        };
+        spawn_receiver_thread(socket, stop, queue);
         receiver
     }
 
+    /// Receives a packet, returning an IO error with io::ErrorKind::Interrupted
+    /// if the stop signal was used.
+    pub fn recv<P: Packet>(&mut self) -> crate::Result<(P, DateTime<Utc>)> {
+        while !self.stop.get() {
+            match self.recv_non_blocking() {
+                Ok(Some(packet)) => return Ok(packet),
+                Ok(None) => continue,
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Err(Stopped)
+    }
+
     /// Returns `Ok(None)` if no (complete) packet has been read.
-    pub fn recv_non_blocking<'de, P: SchemaReadOwned<DefaultConfig, Dst = P>>(
-        &mut self,
-    ) -> anyhow::Result<Option<(P, DateTime<Utc>)>> {
-        let Some((header, body_bytes)) = self.queue.pop_back() else {
+    pub fn recv_non_blocking<P: Packet>(&mut self) -> io::Result<Option<(P, DateTime<Utc>)>> {
+        let Some((header, body_bytes)) = self.queue.lock().unwrap().pop_back() else {
             return Ok(None);
         };
         if header.packet_timestamp < self.last_packet_timestamp {
@@ -78,17 +102,15 @@ impl Receiver {
                 "Dropped out-of-order message {} for packet {}",
                 header.message_id, header.packet_id
             );
-            self.survival_rate.update(0.0);
             return Ok(None);
         }
         let now = Utc::now().timestamp_micros();
         let latency = (now - header.packet_timestamp) as f32 / 1000.0;
-        if latency > MAX_LATENCY_MS {
+        if latency > self.max_latency_ms {
             trace!(
                 "Dropped message {} for packet {} with {:.2}ms latency",
                 header.message_id, header.packet_id, latency
             );
-            self.survival_rate.update(0.0);
             return Ok(None);
         }
         let (packet_index, info) = match self
@@ -112,47 +134,47 @@ impl Receiver {
                 (index, &mut self.packet_map[index])
             }
         };
-        self.survival_rate.update(1.0);
         let message_id = header.message_id as usize;
-        if !info.found[message_id] {
-            info.found[message_id] = true;
-            info.num_found += 1;
-            trace!(
-                "Received new message {} for packet {} ({}/{}, {:.2}ms latency, {:.0}% survival rate)",
-                message_id,
-                header.packet_id,
-                info.num_found,
-                header.last_message_in_packet + 1,
-                (Utc::now().timestamp_micros() - header.packet_timestamp) as f32 / 1000.0,
-                self.survival_rate.get() * 100.0,
-            );
-            let last_message_in_packet = header.last_message_in_packet as usize;
-            if message_id == last_message_in_packet {
-                // truncate the vector to the true size of the packet
-                info.bytes
-                    .truncate(last_message_in_packet * MAX_MESSAGE_BODY_SIZE + body_bytes.len());
-            }
-            let start = message_id * MAX_MESSAGE_BODY_SIZE;
-            let end = start + body_bytes.len();
-            info.bytes[start..end].copy_from_slice(&body_bytes);
+        if info.found[message_id] {
+            return Ok(None);
+        }
+        info.found[message_id] = true;
+        info.num_found += 1;
+        trace!(
+            "Received new message {} for packet {} ({}/{}, {:.2}ms latency)",
+            message_id,
+            header.packet_id,
+            info.num_found,
+            header.last_message_in_packet + 1,
+            (Utc::now().timestamp_micros() - header.packet_timestamp) as f32 / 1000.0,
+        );
+        let last_message_in_packet = header.last_message_in_packet as usize;
+        if message_id == last_message_in_packet {
+            // truncate the vector to the true size of the packet
+            info.bytes
+                .truncate(last_message_in_packet * MAX_MESSAGE_BODY_SIZE + body_bytes.len());
+        }
+        let start = message_id * MAX_MESSAGE_BODY_SIZE;
+        let end = start + body_bytes.len();
+        info.bytes[start..end].copy_from_slice(&body_bytes);
 
-            if info.num_found >= info.found.len() {
-                let info = self.packet_map.remove(packet_index).unwrap();
-                debug!(
-                    "Received packet {} with {} byte body ({} messages)",
-                    header.packet_id,
-                    info.bytes.len(),
-                    last_message_in_packet + 1
-                );
-                drop_skipped_packets(header.packet_id, self.last_packet_id, &mut self.packet_map);
-                let packet = wincode::deserialize(&info.bytes)?;
-                self.last_packet_timestamp = header.packet_timestamp;
-                self.last_packet_id = header.packet_id;
-                return Ok(Some((
-                    packet,
-                    DateTime::from_timestamp_micros(info.timestamp).unwrap(),
-                )));
-            }
+        if info.num_found >= info.found.len() {
+            let info = self.packet_map.remove(packet_index).unwrap();
+            debug!(
+                "Received packet {} with {} byte body ({} messages)",
+                header.packet_id,
+                info.bytes.len(),
+                last_message_in_packet + 1
+            );
+            drop_skipped_packets(header.packet_id, self.last_packet_id, &mut self.packet_map);
+            let packet = wincode::deserialize(&info.bytes)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+            self.last_packet_timestamp = header.packet_timestamp;
+            self.last_packet_id = header.packet_id;
+            return Ok(Some((
+                packet,
+                DateTime::from_timestamp_micros(info.timestamp).unwrap(),
+            )));
         }
         Ok(None)
     }
@@ -183,17 +205,17 @@ fn drop_skipped_packets(
     }
     for i in 1..=num_missed {
         let id = last_packet_id.wrapping_add(i);
-        let info = packet_map.get(0).unwrap();
-        if info.id == id {
-            debug!(
-                "Packet {} skipped ({}/{})",
-                info.id,
-                info.num_found,
-                info.found.len()
-            );
-            packet_map.pop_front();
-        } else {
-            debug!("Packet {} skipped (0/unknown)", info.id);
+        match packet_map.get(0) {
+            Some(info) if info.id == id => {
+                debug!(
+                    "Packet {} skipped ({}/{})",
+                    info.id,
+                    info.num_found,
+                    info.found.len()
+                );
+                packet_map.pop_front();
+            }
+            _ => debug!("Packet {} skipped (0/unknown)", id),
         }
     }
 }

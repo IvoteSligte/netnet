@@ -1,21 +1,26 @@
-use chrono::{DateTime, Utc};
-use receiver::Receiver;
 use std::{
     io,
     net::{SocketAddr, UdpSocket},
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use wincode::{SchemaReadOwned, config::DefaultConfig};
 
 pub use wincode::{SchemaRead, SchemaWrite};
 
-mod receiver;
-mod sender;
+pub mod hole_punch;
+pub mod receiver;
+pub mod sender;
+pub use receiver::Receiver;
+pub use sender::Sender;
 
-// TODO: stop signal for sender/receiver threads and streams
 // TODO: reliability mechanism
 // TODO: encryption
+// TODO: periodic connectivity check (i.e. keepalive packets)
+// TODO: buffering? probably necessary to get smooth audio
 
 // Fixed constants
 const MAX_MESSAGE_SIZE: usize = 65507;
@@ -23,10 +28,72 @@ const MESSAGE_HEADER_SIZE: usize = 8 + 4 + 2 + 2; // the encoded size of Message
 const MAX_MESSAGE_BODY_SIZE: usize = MAX_MESSAGE_SIZE - MESSAGE_HEADER_SIZE;
 
 // Can be adjusted
-const MAX_LATENCY_MS: f32 = 100.0;
 const RECV_BUFFER_CAP: usize = 200; // max number of messages in the receive buffer
 const PACKET_MAP_CAP: usize = 10; // max number of packets in the receiver packet map
 const SEND_SLEEP_DURATION: Duration = Duration::from_micros(200);
+// How frequently the receiver checks if the connection should be closed
+const READ_TIMEOUT: Duration = Duration::from_millis(100);
+
+#[derive(Debug)]
+pub enum Error {
+    Io(io::Error),
+    HolePunch(stunclient::Error),
+    Stopped,
+}
+
+impl Error {
+    pub fn io_kind(&self) -> Option<io::ErrorKind> {
+        match self {
+            Error::Io(error) => Some(error.kind()),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<stunclient::Error> for Error {
+    fn from(value: stunclient::Error) -> Self {
+        Self::HolePunch(value)
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Io(error) => error.fmt(f),
+            Error::HolePunch(error) => write!(f, "Hole-punch failed: {error}"),
+            Error::Stopped => f.write_str("Stop signaled"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Default, Clone)]
+pub struct Signal {
+    value: Arc<AtomicBool>,
+}
+
+impl Signal {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set(&self) {
+        self.value.store(true, Ordering::Release);
+    }
+
+    pub fn get(&self) -> bool {
+        self.value.load(Ordering::Acquire)
+    }
+}
 
 // NOTE: make sure there is no implicit padding to prevent encoding/decoding mismatches
 #[derive(Debug, SchemaRead, SchemaWrite)]
@@ -45,54 +112,53 @@ struct PacketInfo {
     num_found: usize,
 }
 
-// TODO: periodic connectivity check (i.e. keepalive packets)
-// TODO: buffering? probably necessary to get smooth audio
-pub struct PacketStream<P> {
-    sender: mpsc::Sender<P>,
-    receiver: Arc<Mutex<Receiver>>,
+pub type TimeStamp = chrono::DateTime<chrono::Utc>;
+
+pub fn now() -> TimeStamp {
+    chrono::Utc::now()
 }
 
-// Prevents P: Clone requirement
-impl<P> Clone for PacketStream<P> {
-    fn clone(&self) -> Self {
-        Self {
-            sender: self.sender.clone(),
-            receiver: self.receiver.clone(),
-        }
-    }
+/// Trait automatically implemented for all types implementing [Send], [wincode::SchemaReadOwned], and [wincode::SchemaWrite]
+pub trait Packet:
+    SchemaReadOwned<DefaultConfig, Dst = Self> + SchemaWrite<DefaultConfig, Src = Self> + Send + 'static
+{
 }
 
-impl<P> PacketStream<P> {
-    // TODO: separate `send` thread
-    pub fn new(port: u16, connect_to: SocketAddr) -> io::Result<Self>
-    where
-        P: SchemaWrite<DefaultConfig, Src = P> + Send + 'static,
-    {
-        let socket = UdpSocket::bind(format!("0.0.0.0:{port}"))?;
-        socket.connect(connect_to)?;
-        Ok(Self {
-            sender: sender::spawn_thread(socket.try_clone()?),
-            receiver: Receiver::new(socket),
-        })
-    }
+impl<P> Packet for P where
+    P: SchemaReadOwned<DefaultConfig, Dst = Self>
+        + SchemaWrite<DefaultConfig, Src = Self>
+        + Send
+        + 'static
+{
+}
 
-    pub fn send(&self, packet: P) {
-        self.sender.send(packet).unwrap();
-    }
+pub use hole_punch::create_stream_using_hole_punch;
 
-    /// Receives a packet, panicking if stop has been signaled.
-    pub fn recv(&self) -> anyhow::Result<(P, DateTime<Utc>)>
-    where
-        P: SchemaReadOwned<DefaultConfig, Dst = P>,
-    {
-        loop {
-            match self.receiver.lock().unwrap().recv_non_blocking() {
-                Ok(Some(packet)) => return Ok(packet),
-                Ok(None) => continue,
-                Err(err) => return Err(err),
-            }
-        }
-    }
+pub fn create_stream_from_socket<P: Packet>(
+    socket: UdpSocket,
+    connect_to: SocketAddr,
+    max_latency: Duration,
+    stop: Signal,
+) -> io::Result<(Sender<P>, Receiver)> {
+    socket.connect(connect_to)?;
+    Ok((
+        Sender::new(socket.try_clone()?),
+        Receiver::new(socket, stop, max_latency),
+    ))
+}
+
+pub fn create_stream<P: Packet>(
+    port: u16,
+    connect_to: SocketAddr,
+    max_latency: Duration,
+    stop: Signal,
+) -> io::Result<(Sender<P>, Receiver)> {
+    create_stream_from_socket(
+        UdpSocket::bind(("::", port))?,
+        connect_to,
+        max_latency,
+        stop,
+    )
 }
 
 pub(crate) struct RunningAverage {
