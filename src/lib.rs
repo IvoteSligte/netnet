@@ -7,37 +7,53 @@ use std::{
     },
     time::Duration,
 };
-use wincode::{SchemaReadOwned, config::DefaultConfig};
 
 pub use wincode::{SchemaRead, SchemaWrite};
 
-pub mod hole_punch;
-pub mod receiver;
-pub mod sender;
-pub use receiver::Receiver;
-pub use sender::Sender;
+mod reliable;
+mod message;
+mod packet;
 
 // TODO: reliability mechanism
 // TODO: encryption
 // TODO: periodic connectivity check (i.e. keepalive packets)
 // TODO: buffering? probably necessary to get smooth audio
 
-// Fixed constants
-const MAX_MESSAGE_SIZE: usize = 65507;
-const MESSAGE_HEADER_SIZE: usize = 8 + 4 + 2 + 2; // the encoded size of MessageHeader in bytes
-const MAX_MESSAGE_BODY_SIZE: usize = MAX_MESSAGE_SIZE - MESSAGE_HEADER_SIZE;
+pub type TimeStamp = chrono::DateTime<chrono::Utc>;
+pub use chrono::TimeDelta;
 
-// Can be adjusted
-const RECV_BUFFER_CAP: usize = 200; // max number of messages in the receive buffer
-const PACKET_MAP_CAP: usize = 10; // max number of packets in the receiver packet map
-const SEND_SLEEP_DURATION: Duration = Duration::from_micros(200);
-// How frequently the receiver checks if the connection should be closed
-const READ_TIMEOUT: Duration = Duration::from_millis(100);
+// Creates a timestamp for the current time, rounded to the nearest microsecond
+// so that sender and receiver timestamps are exactly equal.
+pub fn now() -> TimeStamp {
+    TimeStamp::from_timestamp_micros(chrono::Utc::now().timestamp_micros()).unwrap()
+}
+
+pub fn create_stream_from_socket(
+    socket: UdpSocket,
+    connect_to: SocketAddr,
+    max_latency: Duration,
+    stop: Signal,
+) -> io::Result<(packet::Sender, packet::Receiver)> {
+    packet::create_stream(socket, stop)
+}
+
+pub fn create_stream(
+    port: u16,
+    connect_to: SocketAddr,
+    max_latency: Duration,
+    stop: Signal,
+) -> io::Result<(packet::Sender, packet::Receiver)> {
+    create_stream_from_socket(
+        UdpSocket::bind(("::", port))?,
+        connect_to,
+        max_latency,
+        stop,
+    )
+}
 
 #[derive(Debug)]
 pub enum Error {
     Io(io::Error),
-    HolePunch(stunclient::Error),
     Stopped,
 }
 
@@ -56,17 +72,10 @@ impl From<io::Error> for Error {
     }
 }
 
-impl From<stunclient::Error> for Error {
-    fn from(value: stunclient::Error) -> Self {
-        Self::HolePunch(value)
-    }
-}
-
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Io(error) => error.fmt(f),
-            Error::HolePunch(error) => write!(f, "Hole-punch failed: {error}"),
             Error::Stopped => f.write_str("Stop signaled"),
         }
     }
@@ -93,72 +102,6 @@ impl Signal {
     pub fn get(&self) -> bool {
         self.value.load(Ordering::Acquire)
     }
-}
-
-// NOTE: make sure there is no implicit padding to prevent encoding/decoding mismatches
-#[derive(Debug, SchemaRead, SchemaWrite)]
-struct MessageHeader {
-    packet_timestamp: i64,
-    packet_id: u32,
-    message_id: u16,
-    last_message_in_packet: u16,
-}
-
-struct PacketInfo {
-    timestamp: i64,
-    id: u32,
-    bytes: Vec<u8>,
-    found: Vec<bool>,
-    num_found: usize,
-}
-
-pub type TimeStamp = chrono::DateTime<chrono::Utc>;
-
-pub fn now() -> TimeStamp {
-    chrono::Utc::now()
-}
-
-/// Trait automatically implemented for all types implementing [Send], [wincode::SchemaReadOwned], and [wincode::SchemaWrite]
-pub trait Packet:
-    SchemaReadOwned<DefaultConfig, Dst = Self> + SchemaWrite<DefaultConfig, Src = Self> + Send + 'static
-{
-}
-
-impl<P> Packet for P where
-    P: SchemaReadOwned<DefaultConfig, Dst = Self>
-        + SchemaWrite<DefaultConfig, Src = Self>
-        + Send
-        + 'static
-{
-}
-
-pub use hole_punch::create_stream_using_hole_punch;
-
-pub fn create_stream_from_socket<P: Packet>(
-    socket: UdpSocket,
-    connect_to: SocketAddr,
-    max_latency: Duration,
-    stop: Signal,
-) -> io::Result<(Sender<P>, Receiver)> {
-    socket.connect(connect_to)?;
-    Ok((
-        Sender::new(socket.try_clone()?),
-        Receiver::new(socket, stop, max_latency),
-    ))
-}
-
-pub fn create_stream<P: Packet>(
-    port: u16,
-    connect_to: SocketAddr,
-    max_latency: Duration,
-    stop: Signal,
-) -> io::Result<(Sender<P>, Receiver)> {
-    create_stream_from_socket(
-        UdpSocket::bind(("::", port))?,
-        connect_to,
-        max_latency,
-        stop,
-    )
 }
 
 pub(crate) struct RunningAverage {

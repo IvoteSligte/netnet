@@ -16,7 +16,7 @@ const MAX_LATENCY: Duration = Duration::from_secs(1000);
 
 const PACKET_COOLDOWN: Duration = Duration::from_nanos(1_000_000_000 / PACKETS_PER_SEC);
 
-fn create_stream(port: u16, port_other: u16, stop: Signal) -> (Sender<Vec<u8>>, Receiver) {
+fn create_stream(port: u16, port_other: u16, stop: Signal) -> (Sender<Vec<u8>>, Receiver<Vec<u8>>) {
     netnet::create_stream(
         port,
         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port_other),
@@ -31,7 +31,7 @@ fn spawn_receiver(stop: Signal) -> JoinHandle<Vec<TimeStamp>> {
         let (_, mut receiver) = create_stream(PORT_RECEIVER, PORT_SENDER, stop);
         let mut received = Vec::new();
         loop {
-            let (_packet, timestamp) = match receiver.recv::<Vec<u8>>() {
+            let (_packet, timestamp) = match receiver.recv() {
                 Ok(t) => t,
                 Err(Error::Stopped) => break,
                 Err(err) => unreachable!("Receive error: {err}"),
@@ -60,7 +60,7 @@ fn spawn_sender(stop_receiver: Signal) -> JoinHandle<Vec<TimeStamp>> {
 
         while (Instant::now() - start) < DURATION {
             rand::fill(&mut packet);
-            let timestamp = sender.send(packet.clone());
+            let timestamp = sender.send_unreliable(packet.clone());
             println!("Sent packet {} (ID)", timestamp.timestamp_micros());
             sent.push(timestamp);
             let now = Instant::now();

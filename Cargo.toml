@@ -7,7 +7,6 @@ edition = "2024"
 anyhow = "1.0.103"
 chrono = "0.4.45"
 log = "0.4.33"
-stunclient = "0.4.2"
 wincode = { version = "0.5.5", features = ["derive"] }
 
 [dev-dependencies]
