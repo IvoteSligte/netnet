@@ -1,6 +1,4 @@
 use std::{
-    collections::HashSet,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
     thread::JoinHandle,
     time::{Duration, Instant},
 };
@@ -18,17 +16,21 @@ const PACKET_COOLDOWN: Duration = Duration::from_nanos(1_000_000_000 / PACKETS_P
 
 fn spawn_receiver(stop: Signal) -> JoinHandle<usize> {
     std::thread::spawn(move || {
-        let (_, receiver) = netnet::create_client(("::", PORT_RECEIVER), MAX_LATENCY, stop).unwrap();
+        let (_, receiver) =
+            netnet::create_client(("::", PORT_RECEIVER), MAX_LATENCY, stop).unwrap();
         let mut num_received = 0;
         loop {
-            let (_packet, timestamp) = match receiver.recv::<Vec<u8>>() {
+            let packet = match receiver.recv() {
                 Ok(t) => t,
                 Err(Error::Stopped) => break,
                 Err(err) => unreachable!("Receive error: {err}"),
             };
             println!(
                 "Received packet (latency: {:.2}ms)",
-                (netnet::now() - timestamp).num_microseconds().unwrap() as f32 / 1000.0
+                netnet::since_micros(packet.timestamp)
+                    .num_microseconds()
+                    .unwrap() as f32
+                    / 1000.0
             );
             num_received += 1;
         }
@@ -41,15 +43,14 @@ fn spawn_sender(stop_receiver: Signal) -> JoinHandle<usize> {
     let start = Instant::now();
 
     std::thread::spawn(move || {
-        let mut packet = vec![0u8; PACKET_SIZE];
         let (sender, _) = netnet::create_server(PORT_SENDER, MAX_LATENCY, Signal::new()).unwrap();
-
         let mut last_packet_instant = Instant::now();
-
         let mut num_sent = 0;
+
         while (Instant::now() - start) < DURATION {
+            let mut packet = vec![0u8; PACKET_SIZE];
             rand::fill(&mut packet);
-            sender.send(&packet).unwrap();
+            sender.send(packet).unwrap();
             println!("Sent packet");
             num_sent += 1;
             let now = Instant::now();
