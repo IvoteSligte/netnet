@@ -5,12 +5,10 @@ use std::{
     time::Duration,
 };
 
-use log::{info, trace, warn};
+use log::{debug, info, trace, warn};
 
 use crate::{
-    CONNECT_PACKET, KEEPALIVE_PACKET, MAX_PACKET_SIZE, Packet, Sender, Signal, TimeDelta,
-    error::{Error, Result, ThreadHandle, take_thread_error},
-    is_timeout, since, since_micros,
+    CONNECT_PACKET, KEEPALIVE_PACKET, MAX_PACKET_SIZE, MAX_UDP_PACKET_SIZE, Packet, Sender, Signal, TimeDelta, error::{Error, Result, ThreadHandle, take_thread_error}, is_timeout, since, since_micros
 };
 
 fn recv(
@@ -61,12 +59,12 @@ impl Receiver {
         let thread_handle = std::thread::spawn(move || {
             socket2.set_read_timeout(Some(Duration::from_micros(200)))?;
             let mut last_received_at = crate::now();
-            let mut buf = vec![0u8; MAX_PACKET_SIZE];
+            let mut buf = vec![0u8; MAX_UDP_PACKET_SIZE];
             while !stop2.get() {
                 let num_read = match recv(&socket2, &mut buf, &connected2, label) {
                     Ok(num_read) => num_read,
                     Err(ref err) if is_timeout(err) => {
-                        if since(last_received_at) > TimeDelta::seconds(5) {
+                        if connected2.get() && since(last_received_at) > TimeDelta::seconds(5) {
                             warn!(
                                 "{label}: Disconnected from peer after no packets received for 5 seconds"
                             );
@@ -86,12 +84,13 @@ impl Receiver {
                     trace!("{label}: Received KEEPALIVE packet");
                     continue;
                 }
-                trace!(
+                debug!(
                     "{label}: Received {} byte packet (latency: {:.2}ms)",
                     packet.body.len(),
                     since_micros(packet.timestamp).num_microseconds().unwrap() as f32 / 1000.0
                 );
                 if since_micros(packet.timestamp) > max_latency {
+                    debug!("{label}: Dropping packet due to latency");
                     continue;
                 }
                 channel_sender.send(packet).unwrap();
