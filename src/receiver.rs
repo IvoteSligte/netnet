@@ -8,7 +8,7 @@ use std::{
 use log::{debug, info, trace, warn};
 
 use crate::{
-    CONNECT_PACKET, KEEPALIVE_PACKET, MAX_PACKET_SIZE, MAX_UDP_PACKET_SIZE, Packet, Sender, Signal, TimeDelta, error::{Error, Result, ThreadHandle, take_thread_error}, is_timeout, since, since_micros
+    CONNECT_PACKET, KEEPALIVE_PACKET, MAX_UDP_PACKET_SIZE, Packet, Sender, Signal, TimeDelta, error::{Error, Result, ThreadHandle, take_thread_error}, is_timeout, since, since_micros
 };
 
 fn recv(
