@@ -6,27 +6,24 @@ use std::{
 use netnet::*;
 
 const PORT_SENDER: u16 = 8082;
-const PORT_RECEIVER: u16 = 8083;
 const DURATION: Duration = Duration::from_secs(3);
-const PACKETS_PER_SEC: u64 = 30;
-const PACKET_SIZE: usize = 3_141_592;
+const PACKET_SIZE: usize = 31_592; // arbitrary
 const MAX_LATENCY: TimeDelta = TimeDelta::seconds(1000);
-
-const PACKET_COOLDOWN: Duration = Duration::from_nanos(1_000_000_000 / PACKETS_PER_SEC);
 
 fn spawn_receiver(stop: Signal) -> JoinHandle<usize> {
     std::thread::spawn(move || {
-        let (_, receiver) =
-            netnet::create_client(("::", PORT_RECEIVER), MAX_LATENCY, stop).unwrap();
+        let (sender, receiver) =
+            netnet::create_client(("::", PORT_SENDER), MAX_LATENCY, stop, Some("REC")).unwrap();
         let mut num_received = 0;
         loop {
             let packet = match receiver.recv() {
                 Ok(t) => t,
                 Err(Error::Stopped) => break,
-                Err(err) => unreachable!("Receive error: {err}"),
+                Err(err) => panic!("Receive error: {err}"),
             };
             println!(
-                "Received packet (latency: {:.2}ms)",
+                "Received {} byte packet (latency: {:.2}ms)",
+                packet.body.len(),
                 netnet::since_micros(packet.timestamp)
                     .num_microseconds()
                     .unwrap() as f32
@@ -35,29 +32,26 @@ fn spawn_receiver(stop: Signal) -> JoinHandle<usize> {
             num_received += 1;
         }
         println!("Finished receiving packets");
+        // sender must be kept alive until now to maintain the connection
+        drop(sender);
         num_received
     })
 }
 
 fn spawn_sender(stop_receiver: Signal) -> JoinHandle<usize> {
     let start = Instant::now();
+    let receiver =
+        netnet::create_server(PORT_SENDER, MAX_LATENCY, Signal::new(), Some("SEN")).unwrap();
 
     std::thread::spawn(move || {
-        let (sender, _) = netnet::create_server(PORT_SENDER, MAX_LATENCY, Signal::new()).unwrap();
-        let mut last_packet_instant = Instant::now();
+        let sender = receiver.accept().unwrap();
         let mut num_sent = 0;
 
         while (Instant::now() - start) < DURATION {
             let mut packet = vec![0u8; PACKET_SIZE];
             rand::fill(&mut packet);
             sender.send(packet).unwrap();
-            println!("Sent packet");
             num_sent += 1;
-            let now = Instant::now();
-            if (now - last_packet_instant) < PACKET_COOLDOWN {
-                std::thread::sleep(now - last_packet_instant);
-            }
-            last_packet_instant = now;
         }
         println!("Waiting a few seconds, hoping that the receiver receives all the packets...");
         std::thread::sleep(Duration::from_secs(1));

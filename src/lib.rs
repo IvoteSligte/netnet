@@ -7,8 +7,7 @@ use std::{
     },
 };
 
-use log::{info, trace};
-pub use wincode::{SchemaRead, SchemaWrite};
+use log::info;
 
 pub mod error;
 pub mod packet;
@@ -62,43 +61,44 @@ pub fn create_client(
     connect_to: impl ToSocketAddrs,
     max_latency: TimeDelta,
     stop: Signal,
+    label: Option<&'static str>,
 ) -> io::Result<(Sender, Receiver)> {
     let socket = UdpSocket::bind("[::]:0")?;
+    info!("Bound client to random port");
     let connected = Signal::new();
     let receiver = Receiver::new(
         socket.try_clone()?,
         max_latency,
         connected.clone(),
         stop.clone(),
-    );
-    let sender = Sender::new(socket, connect_to, max_latency, connected, stop)?;
+        label,
+    )?;
+    info!("Created receiver for client");
+    let sender = Sender::new(socket, connect_to, max_latency, connected, stop, label)?;
+    info!("Created sender for client");
     Ok((sender, receiver))
 }
 
+/// Use [Receiver::accept] to get a [Sender] for the connection as soon as a client connects.
 pub fn create_server(
     port: u16,
     max_latency: TimeDelta,
     stop: Signal,
-) -> io::Result<(Sender, Receiver)> {
+    label: Option<&'static str>,
+) -> io::Result<Receiver> {
     let socket = UdpSocket::bind(("::", port))?;
     info!("Bound server to port {port}");
 
     let connected = Signal::new();
-    let receiver = Receiver::new(        socket.try_clone()?, max_latency, connected.clone(), stop.clone());
-    while !receiver.is_connected() {
-        trace!("Server waiting for client connection");
-        continue;
-    }
-    info!("Server connected to client");
-    let peer_addr = socket.peer_addr()?;
-    let sender = Sender::new(
-        socket,
-        peer_addr,
+    let receiver = Receiver::new(
+        socket.try_clone()?,
         max_latency,
-        connected,
-        stop,
+        connected.clone(),
+        stop.clone(),
+        label,
     )?;
-    Ok((sender, receiver))
+    info!("Created receiver for server");
+    Ok(receiver)
 }
 
 #[derive(Default, Clone)]

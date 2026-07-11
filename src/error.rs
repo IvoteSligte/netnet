@@ -2,6 +2,8 @@ use std::io;
 use std::sync::{Mutex, mpsc};
 use std::thread::JoinHandle;
 
+use crate::MAX_PACKET_SIZE;
+
 pub type ThreadHandle = Mutex<Option<JoinHandle<Result<()>>>>;
 
 /// Returns [None] if the thread's result has already been extracted.
@@ -16,12 +18,12 @@ pub fn take_thread_error(handle: &ThreadHandle) -> Option<Error> {
 pub enum Error {
     /// Failed to write to socket or read from socket
     Io(io::Error),
-    /// Failed to serialize packet
-    Serialize(wincode::WriteError),
-    /// Failed to deserialize packet
-    Deserialize(wincode::ReadError),
     /// Internal mpsc channel closed
     ChannelClosed,
+    /// Packet may not be larger than MAX_PACKET_BODY_SIZE bytes.
+    PacketTooLarge(usize),
+    /// Failed to deserialize UDP packet to [Packet](crate::Packet)
+    Deserialize(std::array::TryFromSliceError),
     /// Stopped due to stop signal sent by user
     Stopped,
     /// Called Receiver::recv after an error was previously returned
@@ -51,14 +53,8 @@ impl From<mpsc::RecvError> for Error {
     }
 }
 
-impl From<wincode::WriteError> for Error {
-    fn from(value: wincode::WriteError) -> Self {
-        Self::Serialize(value)
-    }
-}
-
-impl From<wincode::ReadError> for Error {
-    fn from(value: wincode::ReadError) -> Self {
+impl From<std::array::TryFromSliceError> for Error {
+    fn from(value: std::array::TryFromSliceError) -> Self {
         Self::Deserialize(value)
     }
 }
@@ -67,10 +63,10 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Io(error) => error.fmt(f),
-            Error::Serialize(error) => error.fmt(f),
-            Error::Deserialize(error) => error.fmt(f),
             Error::Stopped => f.write_str("Stop signaled"),
             Error::ChannelClosed => f.write_str("Mspc channel closed"),
+            Error::Deserialize(error) => write!(f, "Failed to deserialize Packet: {error}"),
+            Error::PacketTooLarge(size) => write!(f, "Packet is too large: {size} > {MAX_PACKET_SIZE}"),
             Error::RecvAfterError => {
                 f.write_str("Called Receiver::recv after it previously returned an error")
             }
