@@ -11,7 +11,7 @@ use crate::{
     CONNECT_PACKET, KEEPALIVE_PACKET, MAX_PACKET_SIZE, MAX_UDP_PACKET_SIZE, Packet, Signal,
     TimeDelta,
     error::{Error, Result, ThreadHandle, take_thread_error},
-    since, since_micros,
+    latency_micros, since, since_micros,
 };
 
 #[derive(Clone)]
@@ -40,24 +40,34 @@ impl Sender {
             let mut last_sent_at = crate::now();
             while !stop.get() {
                 let packet = {
-                    if !connected.get() {
-                        trace!("{label}: Sending CONNECT packet");
-                        CONNECT_PACKET
-                    } else {
-                        match channel_receiver.recv_timeout(Duration::from_micros(100)) {
-                            Ok(packet) if since_micros(packet.timestamp) < max_latency => packet,
-                            Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {
-                                if since(last_sent_at) > TimeDelta::milliseconds(500) {
-                                    trace!("{label}: Sending KEEPALIVE packet");
-                                    KEEPALIVE_PACKET
-                                } else {
-                                    continue;
+                    match channel_receiver.recv_timeout(Duration::from_micros(100)) {
+                        Ok(packet) if since_micros(packet.timestamp) < max_latency => {
+                            trace!(
+                                "{label}: Channel packet latency: {:.2}ms",
+                                latency_micros(packet.timestamp)
+                            );
+                            packet
+                        }
+                        result @ (Ok(_) | Err(mpsc::RecvTimeoutError::Timeout)) => {
+                            if !connected.get() {
+                                trace!("{label}: Sending CONNECT packet");
+                                CONNECT_PACKET
+                            } else if since(last_sent_at) > TimeDelta::milliseconds(500) {
+                                trace!("{label}: Sending KEEPALIVE packet");
+                                KEEPALIVE_PACKET
+                            } else {
+                                if let Ok(packet) = result {
+                                    debug!(
+                                        "{label}: Packet dropped from channel due to latency ({:.2}ms)",
+                                        latency_micros(packet.timestamp)
+                                    );
                                 }
+                                continue;
                             }
-                            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                                warn!("{label}: Sender channel closed");
-                                return Err(Error::ChannelClosed);
-                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            warn!("{label}: Sender channel closed");
+                            return Err(Error::ChannelClosed);
                         }
                     }
                 };

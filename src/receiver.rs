@@ -10,7 +10,7 @@ use log::{debug, info, trace, warn};
 use crate::{
     CONNECT_PACKET, KEEPALIVE_PACKET, MAX_UDP_PACKET_SIZE, Packet, Sender, Signal, TimeDelta,
     error::{Error, Result, ThreadHandle, take_thread_error},
-    is_timeout, since, since_micros,
+    is_timeout, latency_micros, since, since_micros,
 };
 
 fn recv(
@@ -90,7 +90,7 @@ impl Receiver {
                 debug!(
                     "{label}: Received {} byte packet (latency: {:.2}ms)",
                     packet.body.len(),
-                    since_micros(packet.timestamp).num_microseconds().unwrap() as f32 / 1000.0
+                    latency_micros(packet.timestamp)
                 );
                 if since_micros(packet.timestamp) > max_latency {
                     debug!("{label}: Dropping packet due to latency");
@@ -160,8 +160,7 @@ impl Receiver {
                     let latency = since_micros(packet.timestamp);
                     if latency > self.max_latency {
                         debug!(
- 
-                           "Dropping packet from receiver channel due to latency ({:.2}ms)",
+                            "Dropped packet from receiver channel due to latency ({:.2}ms)",
                             latency.num_microseconds().unwrap() as f32 / 1000.0
                         );
                         continue;

@@ -24,10 +24,7 @@ fn spawn_receiver(stop: Signal) -> JoinHandle<usize> {
             println!(
                 "Received {} byte packet (latency: {:.2}ms)",
                 packet.body.len(),
-                netnet::since_micros(packet.timestamp)
-                    .num_microseconds()
-                    .unwrap() as f32
-                    / 1000.0
+                netnet::latency_micros(packet.timestamp)
             );
             num_received += 1;
         }

@@ -51,6 +51,11 @@ pub fn since_micros(micros: i64) -> TimeDelta {
     since(from_micros(micros))
 }
 
+/// Returns the time in milliseconds since the microsecond-based timestamp
+pub fn latency_micros(timestamp: i64) -> f32 {
+    since_micros(timestamp).num_microseconds().unwrap() as f32 / 1000.0
+}
+
 pub(crate) fn is_timeout(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::WouldBlock || err.kind() == io::ErrorKind::TimedOut
 }
