@@ -8,7 +8,9 @@ use std::{
 use log::{debug, info, trace, warn};
 
 use crate::{
-    CONNECT_PACKET, KEEPALIVE_PACKET, MAX_UDP_PACKET_SIZE, Packet, Sender, Signal, TimeDelta, error::{Error, Result, ThreadHandle, take_thread_error}, is_timeout, since, since_micros
+    CONNECT_PACKET, KEEPALIVE_PACKET, MAX_UDP_PACKET_SIZE, Packet, Sender, Signal, TimeDelta,
+    error::{Error, Result, ThreadHandle, take_thread_error},
+    is_timeout, since, since_micros,
 };
 
 fn recv(
@@ -31,6 +33,7 @@ fn recv(
 }
 
 // TODO: out-of-order buffer and filter
+// TODO: deduplication filter
 
 pub struct Receiver {
     channel: mpsc::Receiver<Packet>,
@@ -150,8 +153,25 @@ impl Receiver {
     }
 
     pub fn recv(&self) -> Result<Packet> {
-        self.channel
-            .recv()
-            .map_err(|_| take_thread_error(&self.thread_handle).unwrap_or(Error::RecvAfterError))
+        // TODO: use a fixed-size queue instead of variable-size channel to prevent infinitely growing memory
+        loop {
+            return match self.channel.recv() {
+                Ok(packet) => {
+                    let latency = since_micros(packet.timestamp);
+                    if latency > self.max_latency {
+                        debug!(
+ 
+                           "Dropping packet from receiver channel due to latency ({:.2}ms)",
+                            latency.num_microseconds().unwrap() as f32 / 1000.0
+                        );
+                        continue;
+                    }
+                    Ok(packet)
+                }
+                Err(_) => {
+                    Err(take_thread_error(&self.thread_handle).unwrap_or(Error::RecvAfterError))
+                }
+            };
+        }
     }
 }

@@ -8,7 +8,10 @@ use std::{
 use log::{debug, trace, warn};
 
 use crate::{
-    CONNECT_PACKET, KEEPALIVE_PACKET, MAX_PACKET_SIZE, MAX_UDP_PACKET_SIZE, Packet, Signal, TimeDelta, error::{Error, Result, ThreadHandle, take_thread_error}, since, since_micros
+    CONNECT_PACKET, KEEPALIVE_PACKET, MAX_PACKET_SIZE, MAX_UDP_PACKET_SIZE, Packet, Signal,
+    TimeDelta,
+    error::{Error, Result, ThreadHandle, take_thread_error},
+    since, since_micros,
 };
 
 #[derive(Clone)]
@@ -58,7 +61,10 @@ impl Sender {
                         }
                     }
                 };
-                debug!("Sending {} byte packet", packet.body.len());
+                // only report non-control packets with the debug log level to prevent log spam
+                if packet.body.len() > 0 {
+                    debug!("Sending {} byte packet", packet.body.len());
+                }
                 let bytes = packet.to_bytes();
                 debug_assert!(bytes.len() <= MAX_UDP_PACKET_SIZE);
                 socket.send(&bytes)?;
