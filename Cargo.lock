@@ -222,10 +222,19 @@ checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 name = "netnet"
 version = "0.1.0"
 dependencies = [
- "chrono",
  "log",
+ "nettime",
  "pretty_env_logger",
  "rand",
+]
+
+[[package]]
+name = "nettime"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "log",
+ "rsntp",
 ]
 
 [[package]]
@@ -328,6 +337,15 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "rsntp"
+version = "4.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc507d0efdc8ce91a17455b1efe9ada6a21e2414470b3f1d84aefc7ebcf247bd"
+dependencies = [
+ "chrono",
+]
 
 [[package]]
 name = "rustversion"

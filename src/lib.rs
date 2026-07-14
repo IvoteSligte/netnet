@@ -18,43 +18,10 @@ pub use error::{Error, Result};
 pub use packet::*;
 pub use receiver::Receiver;
 pub use sender::Sender;
+pub use nettime::*;
 
 // TODO: encryption
 // TODO: buffering? probably necessary to get smooth audio
-
-pub type TimeStamp = chrono::DateTime<chrono::Utc>;
-pub type TimeDelta = chrono::TimeDelta;
-
-// Creates a timestamp for the current time, rounded to the nearest microsecond
-// so that sender and receiver timestamps are exactly equal.
-pub fn now() -> TimeStamp {
-    from_micros(to_micros(chrono::Utc::now()))
-}
-
-pub fn now_micros() -> i64 {
-    to_micros(now())
-}
-
-pub fn to_micros(timestamp: TimeStamp) -> i64 {
-    timestamp.timestamp_micros()
-}
-
-pub fn from_micros(micros: i64) -> TimeStamp {
-    TimeStamp::from_timestamp_micros(micros).unwrap()
-}
-
-pub fn since(timestamp: TimeStamp) -> TimeDelta {
-    now() - timestamp
-}
-
-pub fn since_micros(micros: i64) -> TimeDelta {
-    since(from_micros(micros))
-}
-
-/// Returns the time in milliseconds since the microsecond-based timestamp
-pub fn latency_micros(timestamp: i64) -> f32 {
-    since_micros(timestamp).num_microseconds().unwrap() as f32 / 1000.0
-}
 
 pub(crate) fn is_timeout(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::WouldBlock || err.kind() == io::ErrorKind::TimedOut
