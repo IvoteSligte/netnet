@@ -1,16 +1,16 @@
 use std::{
     io,
     net::{SocketAddr, UdpSocket},
-    sync::{Mutex, mpsc},
-    time::Duration,
+    sync::Mutex,
+    time::{Duration, Instant},
 };
 
 use log::{debug, info, trace, warn};
 
 use crate::{
-    CONNECT_PACKET, KEEPALIVE_PACKET, MAX_UDP_PACKET_SIZE, Packet, Sender, Signal, TimeDelta,
+    CONNECT_PACKET, KEEPALIVE_PACKET, MAX_UDP_PACKET_SIZE, Packet, Sender, Signal,
     error::{Error, Result, ThreadHandle, take_thread_error},
-    is_timeout, latency_micros, since, since_micros,
+    is_timeout, spsc,
 };
 
 fn recv(
@@ -40,10 +40,9 @@ fn recv(
 // TODO: deduplication filter
 
 pub struct Receiver {
-    channel: mpsc::Receiver<Packet>,
+    channel: spsc::Receiver<Vec<u8>>,
     thread_handle: ThreadHandle,
     socket: UdpSocket,
-    max_latency: TimeDelta,
     connected: Signal,
     stop: Signal,
     label: &'static str,
@@ -52,26 +51,28 @@ pub struct Receiver {
 impl Receiver {
     pub fn new(
         socket: UdpSocket,
-        max_latency: TimeDelta,
         connected: Signal,
         stop: Signal,
         // label used in the logs
         label: Option<&'static str>,
     ) -> io::Result<Self> {
         let label = label.unwrap_or("(unknown)");
-        let (channel_sender, channel_receiver) = std::sync::mpsc::channel();
+        let (channel_sender, channel_receiver) = spsc::channel::<Vec<u8>>(100);
         let socket2 = socket.try_clone()?;
         let connected2 = connected.clone();
         let stop2 = stop.clone();
         let thread_handle = std::thread::spawn(move || {
             socket2.set_read_timeout(Some(Duration::from_micros(200)))?;
-            let mut last_received_at = crate::now();
+            let mut last_received_at = Instant::now();
+            let mut last_packet_id = 0u64;
             let mut buf = vec![0u8; MAX_UDP_PACKET_SIZE];
             while !stop2.get() {
                 let num_read = match recv(&socket2, &mut buf, &connected2, label) {
                     Ok(num_read) => num_read,
                     Err(ref err) if is_timeout(err) => {
-                        if connected2.get() && since(last_received_at) > TimeDelta::seconds(5) {
+                        if connected2.get()
+                            && (Instant::now() - last_received_at) > Duration::from_secs(5)
+                        {
                             warn!(
                                 "{label}: Disconnected from peer after no packets received for 5 seconds"
                             );
@@ -81,7 +82,7 @@ impl Receiver {
                     }
                     Err(err) => return Err(err.into()),
                 };
-                last_received_at = crate::now();
+                last_received_at = Instant::now();
                 let packet = Packet::from_bytes(&buf[..num_read])?;
                 if packet == CONNECT_PACKET {
                     trace!("{label}: Received CONNECT packet");
@@ -91,16 +92,16 @@ impl Receiver {
                     trace!("{label}: Received KEEPALIVE packet");
                     continue;
                 }
-                debug!(
-                    "{label}: Received {} byte packet (latency: {:.2}ms)",
-                    packet.body.len(),
-                    latency_micros(packet.timestamp)
-                );
-                if since_micros(packet.timestamp) > max_latency {
-                    debug!("{label}: Dropping packet due to latency");
+                debug!("{label}: Received {} byte packet", packet.body.len(),);
+                if packet.id < last_packet_id {
+                    debug!("{label}: Dropping out-of-order packet");
                     continue;
                 }
-                channel_sender.send(packet).unwrap();
+                last_packet_id = packet.id;
+                channel_sender
+                    .send(packet.body)
+                    .map_err(|_| Error::ChannelClosed)?;
+                debug!("{label}: Sending packet in channel (total queued: {})", channel_sender.queue_len());
             }
             Err(Error::Stopped)
         });
@@ -108,7 +109,6 @@ impl Receiver {
             channel: channel_receiver,
             thread_handle: Mutex::new(Some(thread_handle)),
             socket,
-            max_latency,
             connected,
             stop,
             label,
@@ -139,7 +139,6 @@ impl Receiver {
         Sender::new(
             self.socket.try_clone()?,
             self.peer_addr()?,
-            self.max_latency,
             self.connected.clone(),
             self.stop.clone(),
             Some(self.label),
@@ -160,43 +159,28 @@ impl Receiver {
         Ok(self.create_sender()?)
     }
 
-    fn recv_maybe_timeout(&self, timeout: Option<Duration>) -> Result<Packet> {
+    fn recv_maybe_timeout(&self, timeout: Option<Duration>) -> Result<Vec<u8>> {
         // TODO: use a fixed-size queue instead of variable-size channel to prevent infinitely growing memory
         loop {
             let received = match timeout {
                 Some(timeout) => match self.channel.recv_timeout(timeout) {
                     Ok(ok) => Ok(ok),
-                    Err(mpsc::RecvTimeoutError::Timeout) => return Err(Error::Timeout),
-                    Err(mpsc::RecvTimeoutError::Disconnected) => Err(mpsc::RecvError),
+                    Err(spsc::RecvTimeoutError::Timeout) => return Err(Error::Timeout),
+                    Err(spsc::RecvTimeoutError::Disconnected) => Err(spsc::RecvError),
                 },
                 None => self.channel.recv(),
             };
-            match received {
-                Ok(packet) => {
-                    let latency = since_micros(packet.timestamp);
-                    if latency > self.max_latency {
-                        debug!(
-                            "Dropped packet from receiver channel due to latency ({:.2}ms)",
-                            latency.num_microseconds().unwrap() as f32 / 1000.0
-                        );
-                        continue;
-                    }
-                    return Ok(packet);
-                }
-                Err(_) => {
-                    return Err(
-                        take_thread_error(&self.thread_handle).unwrap_or(Error::RecvAfterError)
-                    );
-                }
-            };
+            return received.map_err(|_| {
+                take_thread_error(&self.thread_handle).unwrap_or(Error::RecvAfterError)
+            });
         }
     }
 
-    pub fn recv_timeout(&self, timeout: Duration) -> Result<Packet> {
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<Vec<u8>> {
         self.recv_maybe_timeout(Some(timeout))
     }
 
-    pub fn recv(&self) -> Result<Packet> {
+    pub fn recv(&self) -> Result<Vec<u8>> {
         self.recv_maybe_timeout(None)
     }
 }

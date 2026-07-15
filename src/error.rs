@@ -2,7 +2,7 @@ use std::io;
 use std::sync::{Mutex, mpsc};
 use std::thread::JoinHandle;
 
-use crate::MAX_PACKET_SIZE;
+use crate::{MAX_PACKET_SIZE, spsc};
 
 pub type ThreadHandle = Mutex<Option<JoinHandle<Result<()>>>>;
 
@@ -18,12 +18,12 @@ pub fn take_thread_error(handle: &ThreadHandle) -> Option<Error> {
 pub enum Error {
     /// Failed to write to socket or read from socket
     Io(io::Error),
-    /// Internal mpsc channel closed
-    ChannelClosed,
     /// Packet may not be larger than MAX_PACKET_BODY_SIZE bytes.
     PacketTooLarge(usize),
     /// Failed to deserialize UDP packet to [Packet](crate::Packet)
     Deserialize(std::array::TryFromSliceError),
+    /// Internal spsc channel closed
+    ChannelClosed,
     /// [Receiver::recv_timeout] request timed out.
     Timeout,
     /// Stopped due to stop signal sent by user
@@ -51,6 +51,12 @@ impl From<io::Error> for Error {
 
 impl From<mpsc::RecvError> for Error {
     fn from(_value: mpsc::RecvError) -> Self {
+        Self::Stopped
+    }
+}
+
+impl From<spsc::RecvError> for Error {
+    fn from(_value: spsc::RecvError) -> Self {
         Self::Stopped
     }
 }

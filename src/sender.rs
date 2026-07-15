@@ -1,30 +1,28 @@
 use std::{
     io,
     net::{ToSocketAddrs, UdpSocket},
-    sync::{Arc, Mutex, mpsc},
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use log::{debug, trace, warn};
 
 use crate::{
     CONNECT_PACKET, KEEPALIVE_PACKET, MAX_PACKET_SIZE, MAX_UDP_PACKET_SIZE, Packet, Signal,
-    TimeDelta,
     error::{Error, Result, ThreadHandle, take_thread_error},
-    latency_micros, since, since_micros,
+    spsc,
 };
 
-#[derive(Clone)]
 pub struct Sender {
-    channel: mpsc::Sender<Packet>,
+    channel: spsc::Sender<Vec<u8>>,
     thread_handle: Arc<ThreadHandle>,
+    label: &'static str,
 }
 
 impl Sender {
     pub fn new(
         socket: UdpSocket,
         peer_addr: impl ToSocketAddrs,
-        max_latency: TimeDelta,
         connected: Signal,
         stop: Signal,
         // label used in the logs
@@ -35,45 +33,39 @@ impl Sender {
         // In the rest of the code, being "connected" means that the peer is also aware of the connection.
         socket.connect(peer_addr)?;
         debug!("{label}: Socket connected");
-        let (channel_sender, channel_receiver) = mpsc::channel::<Packet>();
+        let (channel_sender, channel_receiver) = spsc::channel::<Vec<u8>>(100);
         let thread_handle = std::thread::spawn(move || {
-            let mut last_sent_at = crate::now();
+            let mut last_sent_at = Instant::now();
+            let mut packet_id = 0;
             while !stop.get() {
-                let packet = {
-                    match channel_receiver.recv_timeout(Duration::from_micros(100)) {
-                        Ok(packet) if since_micros(packet.timestamp) < max_latency => {
-                            trace!(
-                                "{label}: Channel packet latency: {:.2}ms",
-                                latency_micros(packet.timestamp)
-                            );
-                            packet
+                let packet = match channel_receiver.recv_timeout(Duration::from_micros(100)) {
+                    Ok(body) => {
+                        let packet = Packet {
+                            id: packet_id,
+                            body,
+                        };
+                        packet_id += 1;
+                        packet
+                    }
+                    Err(spsc::RecvTimeoutError::Timeout) => {
+                        if !connected.get() {
+                            trace!("{label}: Sending CONNECT packet");
+                            CONNECT_PACKET
+                            // TODO: The client sends CONNECT to the server every 100 micros, which
+                            //     allows the server to be aware of the client near-instantly.
+                            //     However, the client only becomes aware of the connection when
+                            //     it receives a KEEPALIVE packet from the server, which is sent
+                            //     much less frequently, causing an unnecessary delay when connecting.
+                        } else if (Instant::now() - last_sent_at) > Duration::from_millis(500) {
+                            trace!("{label}: Sending KEEPALIVE packet");
+                            KEEPALIVE_PACKET
+                        } else {
+                            continue;
                         }
-                        result @ (Ok(_) | Err(mpsc::RecvTimeoutError::Timeout)) => {
-                            if !connected.get() {
-                                trace!("{label}: Sending CONNECT packet");
-                                CONNECT_PACKET
-                                // TODO: The client sends CONNECT to the server every 100 micros, which
-                                //     allows the server to be aware of the client near-instantly.
-                                //     However, the client only becomes aware of the connection when
-                                //     it receives a KEEPALIVE packet from the server, which is sent
-                                //     much less frequently, causing an unnecessary delay when connecting.
-                            } else if since(last_sent_at) > TimeDelta::milliseconds(500) {
-                                trace!("{label}: Sending KEEPALIVE packet");
-                                KEEPALIVE_PACKET
-                            } else {
-                                if let Ok(packet) = result {
-                                    debug!(
-                                        "{label}: Packet dropped from channel due to latency ({:.2}ms)",
-                                        latency_micros(packet.timestamp)
-                                    );
-                                }
-                                continue;
-                            }
-                        }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            warn!("{label}: Sender channel closed");
-                            return Err(Error::ChannelClosed);
-                        }
+                    }
+                    Err(spsc::RecvTimeoutError::Disconnected) => {
+                        warn!("{label}: Sender channel closed");
+                        return Err(Error::ChannelClosed);
                     }
                 };
                 // only report non-control packets with the debug log level to prevent log spam
@@ -81,9 +73,9 @@ impl Sender {
                     debug!("Sending {} byte packet", packet.body.len());
                 }
                 let bytes = packet.to_bytes();
-                debug_assert!(bytes.len() <= MAX_UDP_PACKET_SIZE);
+                assert!(bytes.len() <= MAX_UDP_PACKET_SIZE);
                 socket.send(&bytes)?;
-                last_sent_at = crate::now();
+                last_sent_at = Instant::now();
                 // prevent flooding the OS UDP buffer
                 std::thread::sleep(Duration::from_micros(200));
             }
@@ -92,6 +84,7 @@ impl Sender {
         Ok(Self {
             channel: channel_sender,
             thread_handle: Arc::new(Mutex::new(Some(thread_handle))),
+            label,
         })
     }
 
@@ -101,10 +94,13 @@ impl Sender {
             return Err(Error::PacketTooLarge(packet.len()));
         }
         self.channel
-            .send(Packet {
-                timestamp: crate::now_micros(),
-                body: packet,
-            })
-            .map_err(|_| take_thread_error(&self.thread_handle).unwrap_or(Error::SendAfterError))
+            .send(packet)
+            .map_err(|_| take_thread_error(&self.thread_handle).unwrap_or(Error::SendAfterError))?;
+        let label = self.label;
+        debug!(
+            "{label}: Sending packet in channel (total queued: {})",
+            self.channel.queue_len()
+        );
+        Ok(())
     }
 }
