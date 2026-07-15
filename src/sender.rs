@@ -52,6 +52,11 @@ impl Sender {
                             if !connected.get() {
                                 trace!("{label}: Sending CONNECT packet");
                                 CONNECT_PACKET
+                                // TODO: The client sends CONNECT to the server every 100 micros, which
+                                //     allows the server to be aware of the client near-instantly.
+                                //     However, the client only becomes aware of the connection when
+                                //     it receives a KEEPALIVE packet from the server, which is sent
+                                //     much less frequently, causing an unnecessary delay when connecting.
                             } else if since(last_sent_at) > TimeDelta::milliseconds(500) {
                                 trace!("{label}: Sending KEEPALIVE packet");
                                 KEEPALIVE_PACKET

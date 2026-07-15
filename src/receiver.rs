@@ -19,17 +19,21 @@ fn recv(
     connected: &Signal,
     label: &'static str,
 ) -> io::Result<usize> {
-    if connected.get() {
-        let num_read = socket.recv(buf)?;
-        Ok(num_read)
-    } else {
+    if !connected.get() {
         trace!("{label}: Waiting for connection");
+    }
+    let num_read = if socket.peer_addr().is_ok() {
+        socket.recv(buf)?
+    } else {
         let (num_read, peer_addr) = socket.recv_from(buf)?;
         socket.connect(peer_addr)?;
+        num_read
+    };
+    if !connected.get() {
         connected.set();
         info!("{label}: Connected to peer");
-        Ok(num_read)
     }
+    Ok(num_read)
 }
 
 // TODO: out-of-order buffer and filter
@@ -115,6 +119,10 @@ impl Receiver {
         self.connected.get()
     }
 
+    pub fn connected_signal(&self) -> Signal {
+        self.connected.clone()
+    }
+
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         let addr = self.socket.peer_addr()?;
         if self.is_connected() {
@@ -152,10 +160,18 @@ impl Receiver {
         Ok(self.create_sender()?)
     }
 
-    pub fn recv(&self) -> Result<Packet> {
+    fn recv_maybe_timeout(&self, timeout: Option<Duration>) -> Result<Packet> {
         // TODO: use a fixed-size queue instead of variable-size channel to prevent infinitely growing memory
         loop {
-            return match self.channel.recv() {
+            let received = match timeout {
+                Some(timeout) => match self.channel.recv_timeout(timeout) {
+                    Ok(ok) => Ok(ok),
+                    Err(mpsc::RecvTimeoutError::Timeout) => return Err(Error::Timeout),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => Err(mpsc::RecvError),
+                },
+                None => self.channel.recv(),
+            };
+            match received {
                 Ok(packet) => {
                     let latency = since_micros(packet.timestamp);
                     if latency > self.max_latency {
@@ -165,12 +181,22 @@ impl Receiver {
                         );
                         continue;
                     }
-                    Ok(packet)
+                    return Ok(packet);
                 }
                 Err(_) => {
-                    Err(take_thread_error(&self.thread_handle).unwrap_or(Error::RecvAfterError))
+                    return Err(
+                        take_thread_error(&self.thread_handle).unwrap_or(Error::RecvAfterError)
+                    );
                 }
             };
         }
+    }
+
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<Packet> {
+        self.recv_maybe_timeout(Some(timeout))
+    }
+
+    pub fn recv(&self) -> Result<Packet> {
+        self.recv_maybe_timeout(None)
     }
 }

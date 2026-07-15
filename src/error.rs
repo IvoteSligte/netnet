@@ -24,6 +24,8 @@ pub enum Error {
     PacketTooLarge(usize),
     /// Failed to deserialize UDP packet to [Packet](crate::Packet)
     Deserialize(std::array::TryFromSliceError),
+    /// [Receiver::recv_timeout] request timed out.
+    Timeout,
     /// Stopped due to stop signal sent by user
     Stopped,
     /// Called Receiver::recv after an error was previously returned
@@ -66,7 +68,10 @@ impl std::fmt::Display for Error {
             Error::Stopped => f.write_str("Stop signaled"),
             Error::ChannelClosed => f.write_str("Mspc channel closed"),
             Error::Deserialize(error) => write!(f, "Failed to deserialize Packet: {error}"),
-            Error::PacketTooLarge(size) => write!(f, "Packet is too large: {size} > {MAX_PACKET_SIZE}"),
+            Error::Timeout => f.write_str("Call to Receiver::recv_timeout timed out"),
+            Error::PacketTooLarge(size) => {
+                write!(f, "Packet is too large: {size} > {MAX_PACKET_SIZE}")
+            }
             Error::RecvAfterError => {
                 f.write_str("Called Receiver::recv after it previously returned an error")
             }
