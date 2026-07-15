@@ -2,6 +2,8 @@ use std::io;
 use std::sync::{Mutex, mpsc};
 use std::thread::JoinHandle;
 
+use log::warn;
+
 use crate::{MAX_PACKET_SIZE, spsc};
 
 pub type ThreadHandle = Mutex<Option<JoinHandle<Result<()>>>>;
@@ -9,7 +11,7 @@ pub type ThreadHandle = Mutex<Option<JoinHandle<Result<()>>>>;
 /// Returns [None] if the thread's result has already been extracted.
 pub fn take_thread_error(handle: &ThreadHandle) -> Option<Error> {
     let join_handle: JoinHandle<_> = (&mut *handle.lock().unwrap()).take()?;
-    assert!(join_handle.is_finished());
+    warn!("Waiting for thread to finish after error");
     let result: Result<()> = join_handle.join().unwrap();
     Some(result.unwrap_err())
 }

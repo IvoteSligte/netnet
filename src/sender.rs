@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use log::{debug, trace, warn};
+use log::{debug, error, trace, warn};
 
 use crate::{
     CONNECT_PACKET, KEEPALIVE_PACKET, MAX_PACKET_SIZE, MAX_UDP_PACKET_SIZE, Packet, Signal,
@@ -93,10 +93,11 @@ impl Sender {
         if packet.len() > MAX_PACKET_SIZE {
             return Err(Error::PacketTooLarge(packet.len()));
         }
-        self.channel
-            .send(packet)
-            .map_err(|_| take_thread_error(&self.thread_handle).unwrap_or(Error::SendAfterError))?;
         let label = self.label;
+        self.channel.send(packet).map_err(|_| {
+            error!("{label}: Thread disconnected unexpectedly");
+            take_thread_error(&self.thread_handle).unwrap_or(Error::SendAfterError)
+        })?;
         debug!(
             "{label}: Sending packet in channel (total queued: {})",
             self.channel.queue_len()

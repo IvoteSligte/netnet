@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use log::{debug, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 
 use crate::{
     CONNECT_PACKET, KEEPALIVE_PACKET, MAX_UDP_PACKET_SIZE, Packet, Sender, Signal,
@@ -80,6 +80,12 @@ impl Receiver {
                         }
                         continue;
                     }
+                    Err(ref err)
+                        if cfg!(target_os = "windows") && err.raw_os_error() == Some(997) =>
+                    {
+                        warn!("Ignoring Windows error 997 received when reading from socket");
+                        continue;
+                    }
                     Err(err) => return Err(err.into()),
                 };
                 last_received_at = Instant::now();
@@ -101,7 +107,10 @@ impl Receiver {
                 channel_sender
                     .send(packet.body)
                     .map_err(|_| Error::ChannelClosed)?;
-                debug!("{label}: Sending packet in channel (total queued: {})", channel_sender.queue_len());
+                debug!(
+                    "{label}: Sending packet in channel (total queued: {})",
+                    channel_sender.queue_len()
+                );
             }
             Err(Error::Stopped)
         });
@@ -170,7 +179,9 @@ impl Receiver {
                 },
                 None => self.channel.recv(),
             };
+            let label = self.label;
             return received.map_err(|_| {
+                error!("{label}: Thread disconnected unexpectedly");
                 take_thread_error(&self.thread_handle).unwrap_or(Error::RecvAfterError)
             });
         }
