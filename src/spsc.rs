@@ -15,16 +15,19 @@ pub struct SendError;
 pub struct Sender<T>(Arc<ArrayQueue<T>>);
 
 impl<T> Sender<T> {
-    pub fn send(&self, value: T) -> Result<(), SendError> {
+    pub fn send(&self, value: T) -> Result<Option<T>, SendError> {
         if is_closed(&self.0) {
             return Err(SendError);
         }
-        self.0.force_push(value);
-        Ok(())
+        Ok(self.0.force_push(value))
     }
 
     pub fn queue_len(&self) -> usize {
         self.0.len()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.0.len() == self.0.capacity()
     }
 }
 
@@ -65,10 +68,6 @@ impl<T> Receiver<T> {
                 return Ok(item);
             }
         }
-    }
-
-    pub fn queue_len(&self) -> usize {
-        self.0.len()
     }
 }
 

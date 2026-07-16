@@ -9,6 +9,7 @@ use std::{
 
 use log::info;
 
+pub(crate) mod average;
 pub mod error;
 pub mod packet;
 pub mod receiver;

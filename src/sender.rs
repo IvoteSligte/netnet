@@ -1,7 +1,6 @@
 use std::{
     io,
     net::{ToSocketAddrs, UdpSocket},
-    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -9,13 +8,15 @@ use log::{debug, error, trace, warn};
 
 use crate::{
     CONNECT_PACKET, KEEPALIVE_PACKET, MAX_PACKET_SIZE, MAX_UDP_PACKET_SIZE, Packet, Signal,
+    average::RunningAverage,
     error::{Error, Result, ThreadHandle, take_thread_error},
     spsc,
 };
 
 pub struct Sender {
     channel: spsc::Sender<Vec<u8>>,
-    thread_handle: Arc<ThreadHandle>,
+    thread_handle: ThreadHandle,
+    packet_loss: RunningAverage,
     label: &'static str,
 }
 
@@ -70,7 +71,7 @@ impl Sender {
                 };
                 // only report non-control packets with the debug log level to prevent log spam
                 if packet.body.len() > 0 {
-                    debug!("Sending {} byte packet", packet.body.len());
+                    debug!("{label}: Sending {} byte packet", packet.body.len());
                 }
                 let bytes = packet.to_bytes();
                 assert!(bytes.len() <= MAX_UDP_PACKET_SIZE);
@@ -83,21 +84,30 @@ impl Sender {
         });
         Ok(Self {
             channel: channel_sender,
-            thread_handle: Arc::new(Mutex::new(Some(thread_handle))),
+            thread_handle: Some(thread_handle),
+            packet_loss: RunningAverage::new(1000.0),
             label,
         })
     }
 
     /// `packet` may not be larger than [MAX_PACKET_BODY_SIZE] bytes.
-    pub fn send(&self, packet: Vec<u8>) -> Result<()> {
+    pub fn send(&mut self, packet: Vec<u8>) -> Result<()> {
         if packet.len() > MAX_PACKET_SIZE {
             return Err(Error::PacketTooLarge(packet.len()));
         }
         let label = self.label;
-        self.channel.send(packet).map_err(|_| {
+        let old_packet = self.channel.send(packet).map_err(|_| {
             error!("{label}: Thread disconnected unexpectedly");
-            take_thread_error(&self.thread_handle).unwrap_or(Error::SendAfterError)
+            take_thread_error(&mut self.thread_handle).unwrap_or(Error::SendAfterError)
         })?;
+        if old_packet.is_some() {
+            warn!(
+                "{label}: Wrote to full channel, resulting in packet loss (recent: {:.3}%)",
+                self.packet_loss.update(1.0)
+            );
+        } else {
+            self.packet_loss.update(0.0);
+        }
         debug!(
             "{label}: Sending packet in channel (total queued: {})",
             self.channel.queue_len()

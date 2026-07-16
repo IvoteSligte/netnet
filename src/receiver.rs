@@ -1,7 +1,6 @@
 use std::{
     io,
     net::{SocketAddr, UdpSocket},
-    sync::Mutex,
     time::{Duration, Instant},
 };
 
@@ -9,6 +8,7 @@ use log::{debug, error, info, trace, warn};
 
 use crate::{
     CONNECT_PACKET, KEEPALIVE_PACKET, MAX_UDP_PACKET_SIZE, Packet, Sender, Signal,
+    average::RunningAverage,
     error::{Error, Result, ThreadHandle, take_thread_error},
     is_timeout, spsc,
 };
@@ -64,7 +64,9 @@ impl Receiver {
         let thread_handle = std::thread::spawn(move || {
             socket2.set_read_timeout(Some(Duration::from_micros(200)))?;
             let mut last_received_at = Instant::now();
-            let mut last_packet_id = 0u64;
+            let mut min_packet_id = 0u64;
+            let mut network_packet_loss = RunningAverage::new(1000.0);
+            let mut channel_packet_loss = RunningAverage::new(1000.0);
             let mut buf = vec![0u8; MAX_UDP_PACKET_SIZE];
             while !stop2.get() {
                 let num_read = match recv(&socket2, &mut buf, &connected2, label) {
@@ -98,15 +100,45 @@ impl Receiver {
                     trace!("{label}: Received KEEPALIVE packet");
                     continue;
                 }
-                debug!("{label}: Received {} byte packet", packet.body.len(),);
-                if packet.id < last_packet_id {
-                    debug!("{label}: Dropping out-of-order packet");
+                debug!(
+                    "{label}: Received {} byte packet (id: {})",
+                    packet.body.len(),
+                    packet.id
+                );
+                if packet.id < min_packet_id {
+                    // not changing network_packet_loss here to prevent double counting
+                    debug!("{label}: Dropping out-of-order packet (id: {})", packet.id);
                     continue;
+                } else if packet.id == min_packet_id + 1 {
+                    debug!(
+                        "{label}: Skipping packet (id: {}, recent loss: {:.3}%)",
+                        packet.id,
+                        network_packet_loss.update(1.0) * 100.0
+                    )
+                } else if packet.id > min_packet_id {
+                    debug!(
+                        "{label}: Missed {} packets (ids: {}-{}, recent loss: {:.3}%)",
+                        packet.id - min_packet_id,
+                        min_packet_id,
+                        packet.id - 1,
+                        network_packet_loss.update((packet.id - min_packet_id) as _) * 100.0
+                    )
+                } else {
+                    network_packet_loss.update(0.0);
                 }
-                last_packet_id = packet.id;
-                channel_sender
+                min_packet_id = packet.id + 1;
+                if channel_sender.is_full() {}
+                let old_packet = channel_sender
                     .send(packet.body)
                     .map_err(|_| Error::ChannelClosed)?;
+                if old_packet.is_some() {
+                    warn!(
+                        "{label}: Wrote to full channel, resulting in packet loss (recent: {:.3}%)",
+                        channel_packet_loss.update(1.0) * 100.0
+                    );
+                } else {
+                    channel_packet_loss.update(0.0);
+                }
                 debug!(
                     "{label}: Sending packet in channel (total queued: {})",
                     channel_sender.queue_len()
@@ -116,7 +148,7 @@ impl Receiver {
         });
         Ok(Self {
             channel: channel_receiver,
-            thread_handle: Mutex::new(Some(thread_handle)),
+            thread_handle: Some(thread_handle),
             socket,
             connected,
             stop,
@@ -168,7 +200,7 @@ impl Receiver {
         Ok(self.create_sender()?)
     }
 
-    fn recv_maybe_timeout(&self, timeout: Option<Duration>) -> Result<Vec<u8>> {
+    fn recv_maybe_timeout(&mut self, timeout: Option<Duration>) -> Result<Vec<u8>> {
         // TODO: use a fixed-size queue instead of variable-size channel to prevent infinitely growing memory
         loop {
             let received = match timeout {
@@ -182,16 +214,16 @@ impl Receiver {
             let label = self.label;
             return received.map_err(|_| {
                 error!("{label}: Thread disconnected unexpectedly");
-                take_thread_error(&self.thread_handle).unwrap_or(Error::RecvAfterError)
+                take_thread_error(&mut self.thread_handle).unwrap_or(Error::RecvAfterError)
             });
         }
     }
 
-    pub fn recv_timeout(&self, timeout: Duration) -> Result<Vec<u8>> {
+    pub fn recv_timeout(&mut self, timeout: Duration) -> Result<Vec<u8>> {
         self.recv_maybe_timeout(Some(timeout))
     }
 
-    pub fn recv(&self) -> Result<Vec<u8>> {
+    pub fn recv(&mut self) -> Result<Vec<u8>> {
         self.recv_maybe_timeout(None)
     }
 }
