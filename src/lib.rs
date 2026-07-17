@@ -1,78 +1,90 @@
-use std::{
-    io,
-    net::{ToSocketAddrs, UdpSocket},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-};
+use std::{net::SocketAddr, sync::Arc};
 
-use log::info;
-
-pub(crate) mod average;
+mod average;
 pub mod error;
-pub mod packet;
-pub mod receiver;
-pub mod sender;
-pub mod spsc;
+mod insecure;
 
+use anyhow::anyhow;
 pub use error::{Error, Result};
-pub use packet::*;
-pub use receiver::Receiver;
-pub use sender::Sender;
+use insecure::SkipServerVerification;
+use log::info;
+use quinn::{
+    ClientConfig,
+    crypto::rustls::{QuicClientConfig, QuicServerConfig},
+};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
-// TODO: encryption
-// TODO: buffering? probably necessary to get smooth audio
+pub use quinn::Connection;
 
-pub(crate) fn is_timeout(err: &io::Error) -> bool {
-    err.kind() == io::ErrorKind::WouldBlock || err.kind() == io::ErrorKind::TimedOut
+const SERVER_NAME: &str = "netnet-server";
+const PROTOCOL_NAME: &str = "netnet-protocol";
+
+// TODO: reorder buffer? probably necessary to get smooth audio
+// TODO: forward error correction
+
+// TODO: allow loading cert and key from file
+fn generate_self_signed_cert() -> anyhow::Result<(CertificateDer<'static>, PrivateKeyDer<'static>)>
+{
+    // FIXME: switch to non-localhost?
+    let cert = rcgen::generate_simple_self_signed(vec![SERVER_NAME.to_string()])?;
+    let cert_der = CertificateDer::from(cert.cert);
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
+    Ok((cert_der, key))
 }
 
+/// Requires a Tokio runtime (even to run the sync code)
 pub fn create_client(
-    connect_to: impl ToSocketAddrs,
-    stop: Signal,
-    label: Option<&'static str>,
-) -> io::Result<(Sender, Receiver)> {
-    let socket = UdpSocket::bind("[::]:0")?;
-    info!("Bound client to random port");
-    let connected = Signal::new();
-    let receiver = Receiver::new(socket.try_clone()?, connected.clone(), stop.clone(), label)?;
-    info!("Created receiver for client");
-    let sender = Sender::new(socket, connect_to, connected, stop, label)?;
-    info!("Created sender for client");
-    Ok((sender, receiver))
+    server_addr: SocketAddr,
+) -> anyhow::Result<impl Future<Output = anyhow::Result<Connection>>> {
+    let mut crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        // TEMP: only for debugging
+        .with_custom_certificate_verifier(SkipServerVerification::new())
+        // TEMP: only for debugging
+        .with_no_client_auth();
+    crypto.alpn_protocols = vec![PROTOCOL_NAME.into()];
+    let config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?));
+
+    info!("Creating client endpoint");
+    let mut endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap())?;
+
+    endpoint.set_default_client_config(config);
+
+    info!("Finished creating client endpoint");
+    Ok(async move {
+        info!("Connecting to server");
+        let connecting = endpoint.connect(server_addr, SERVER_NAME)?;
+        Ok(connecting.await?)
+    })
 }
 
-/// Use [Receiver::accept] to get a [Sender] for the connection as soon as a client connects.
-pub fn create_server(port: u16, stop: Signal, label: Option<&'static str>) -> io::Result<Receiver> {
-    let socket = UdpSocket::bind(("::", port))?;
-    info!("Bound server to port {port}");
+/// Requires a Tokio runtime (even to run the sync code)
+pub fn create_server(
+    port: u16,
+) -> anyhow::Result<impl Future<Output = anyhow::Result<Connection>>> {
+    info!("Generating certificate");
+    let (cert, key) = generate_self_signed_cert()?;
 
-    let connected = Signal::new();
-    let receiver = Receiver::new(socket.try_clone()?, connected.clone(), stop.clone(), label)?;
-    info!("Created receiver for server");
-    Ok(receiver)
-}
+    let mut crypto = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)?;
+    crypto.alpn_protocols = vec![PROTOCOL_NAME.into()];
 
-#[derive(Default, Clone)]
-pub struct Signal {
-    value: Arc<AtomicBool>,
-}
+    let mut server_config =
+        quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(crypto)?));
+    let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
+    transport_config.max_concurrent_uni_streams(0_u8.into());
 
-impl Signal {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn set(&self) {
-        self.value.store(true, Ordering::Release);
-    }
-
-    pub fn clear(&self) {
-        self.value.store(false, Ordering::Release);
-    }
-
-    pub fn get(&self) -> bool {
-        self.value.load(Ordering::Acquire)
-    }
+    info!("Creating server endpoint");
+    let endpoint = quinn::Endpoint::server(server_config, format!("[::]:{port}").parse().unwrap())?;
+    info!("Finished creating server endpoint");
+    Ok(async move {
+        info!("Accepting incoming connections");
+        let incoming = endpoint
+            .accept()
+            .await
+            .ok_or(anyhow!("Connection closed while waiting for client"))?;
+        info!("Accepted connection");
+        Ok(incoming.await?)
+    })
 }

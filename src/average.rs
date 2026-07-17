@@ -1,3 +1,5 @@
+#![allow(unused)] // TEMP
+
 pub struct RunningAverage {
     average: f64,
     samples: f64,
