@@ -1,14 +1,9 @@
-use std::{
-    iter,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{iter, sync::Arc, time::Instant};
 
 use bytes::Bytes;
 use log::{debug, info, trace, warn};
 use quinn::Connection;
 use thiserror::Error;
-use tokio::sync::mpsc;
 
 const HEADER_SIZE: usize = 8 + 4 + 4;
 
@@ -92,7 +87,7 @@ impl UnreliableReceiver {
         }
     }
 
-    pub fn recv_timeout(&mut self, timeout: Duration) -> Result<Vec<u8>, RecvTimeoutError> {
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
         let Self {
             channel,
             fragments_per_second,
@@ -103,17 +98,8 @@ impl UnreliableReceiver {
         } = self;
         let start = Instant::now();
 
-        while Instant::now() - start < timeout {
-            let fragment = match channel.try_recv() {
-                Ok(f) => f,
-                Err(mpsc::error::TryRecvError::Empty) => {
-                    std::thread::sleep(Duration::from_millis(1));
-                    continue;
-                }
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    return Err(RecvTimeoutError::Disconnected);
-                }
-            };
+        loop {
+            let fragment = channel.recv().await?;
             if fragment.len() >= HEADER_SIZE {
                 warn!("Received fragment without header");
                 continue;
@@ -168,12 +154,7 @@ impl UnreliableReceiver {
                 packets_per_second.avg()
             );
             let packet_bytes = fragment_map.iter().flatten().copied().collect::<Vec<u8>>();
-            return Ok(packet_bytes);
+            return Some(packet_bytes);
         }
-        Err(RecvTimeoutError::Timeout)
-    }
-
-    pub fn recv(&mut self) -> Option<Vec<u8>> {
-        self.recv_timeout(Duration::MAX).ok()
     }
 }
