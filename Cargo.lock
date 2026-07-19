@@ -266,6 +266,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
+name = "fps_ticker"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe164905ff69757d4bdc4c61d7df2930e47e2f5b4a132895a8f995990b2b9219"
+
+[[package]]
 name = "futures-core"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -464,7 +470,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-compat",
+ "bytes",
  "crossbeam-queue",
+ "fps_ticker",
  "log",
  "pretty_env_logger",
  "quinn",
@@ -472,6 +480,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

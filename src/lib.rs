@@ -1,8 +1,7 @@
-use std::{net::SocketAddr, sync::Arc};
-
-mod average;
-pub mod error;
-mod insecure;
+use std::{
+    net::{IpAddr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+};
 
 use anyhow::anyhow;
 pub use error::{Error, Result};
@@ -14,10 +13,42 @@ use quinn::{
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
-pub use quinn::Connection;
+mod average;
+pub mod error;
+mod insecure;
+pub mod unreliable;
+
+pub use unreliable::{UnreliableReceiver, UnreliableSender, RecvTimeoutError};
 
 const SERVER_NAME: &str = "netnet-server";
 const PROTOCOL_NAME: &str = "netnet-protocol";
+
+pub use quinn::ConnectionError;
+
+// TODO: KEEPALIVE packets (probably on a reliable stream)
+
+/// Create using [create_client] or [create_server]
+pub struct Connection {
+    pub unreliable_sender: UnreliableSender,
+    pub unreliable_receiver: UnreliableReceiver,
+    conn: Arc<quinn::Connection>,
+}
+
+impl Connection {
+    pub(crate) fn new(conn: quinn::Connection) -> Self {
+        let conn = Arc::new(conn);
+        Self {
+            unreliable_sender: UnreliableSender::new(conn.clone()),
+            unreliable_receiver: UnreliableReceiver::new(conn.clone()),
+            conn,
+        }
+    }
+
+    /// Should not be used unless necessary
+    pub fn inner(&self) -> &Arc<quinn::Connection> {
+        &self.conn
+    }
+}
 
 // TODO: reorder buffer? probably necessary to get smooth audio
 // TODO: forward error correction
@@ -46,7 +77,8 @@ pub fn create_client(
     let config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?));
 
     info!("Creating client endpoint");
-    let mut endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap())?;
+    let mut endpoint =
+        quinn::Endpoint::client(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))?;
 
     endpoint.set_default_client_config(config);
 
@@ -54,7 +86,7 @@ pub fn create_client(
     Ok(async move {
         info!("Connecting to server");
         let connecting = endpoint.connect(server_addr, SERVER_NAME)?;
-        Ok(connecting.await?)
+        Ok(Connection::new(connecting.await?))
     })
 }
 
@@ -76,7 +108,10 @@ pub fn create_server(
     transport_config.max_concurrent_uni_streams(0_u8.into());
 
     info!("Creating server endpoint");
-    let endpoint = quinn::Endpoint::server(server_config, format!("[::]:{port}").parse().unwrap())?;
+    let endpoint = quinn::Endpoint::server(
+        server_config,
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port),
+    )?;
     info!("Finished creating server endpoint");
     Ok(async move {
         info!("Accepting incoming connections");
@@ -85,6 +120,6 @@ pub fn create_server(
             .await
             .ok_or(anyhow!("Connection closed while waiting for client"))?;
         info!("Accepted connection");
-        Ok(incoming.await?)
+        Ok(Connection::new(incoming.await?))
     })
 }
