@@ -1,4 +1,8 @@
-use std::{iter, sync::Arc, time::Instant};
+use std::{
+    io::{self, Write},
+    iter,
+    sync::Arc,
+};
 
 use bytes::Bytes;
 use log::{debug, info, trace, warn};
@@ -7,9 +11,37 @@ use thiserror::Error;
 
 const HEADER_SIZE: usize = 8 + 4 + 4;
 
+#[derive(Debug)]
+struct Header {
+    pub packet_index: u64,
+    pub fragment_index: u32,
+    pub total_fragments: u32,
+}
+
+impl Header {
+    pub fn write_to(&self, writer: &mut impl Write) -> io::Result<()> {
+        let mut num_bytes = 0;
+        num_bytes += writer.write(&self.packet_index.to_le_bytes())?;
+        num_bytes += writer.write(&self.fragment_index.to_le_bytes())?;
+        num_bytes += writer.write(&self.total_fragments.to_le_bytes())?;
+        assert_eq!(num_bytes, HEADER_SIZE);
+        Ok(())
+    }
+
+    pub fn read_from(buf: &[u8]) -> io::Result<Self> {
+        Ok(Self {
+            packet_index: u64::from_le_bytes(*buf[0..8].as_array().unwrap()),
+            fragment_index: u32::from_le_bytes(*buf[8..12].as_array().unwrap()),
+            total_fragments: u32::from_le_bytes(*buf[12..16].as_array().unwrap()),
+        })
+    }
+}
+
 pub struct UnreliableSender {
     conn: Arc<Connection>,
     packet_index: u64,
+    fragments_per_second: fps_ticker::Fps,
+    packets_per_second: fps_ticker::Fps,
 }
 
 impl UnreliableSender {
@@ -17,6 +49,8 @@ impl UnreliableSender {
         Self {
             conn,
             packet_index: 0,
+            fragments_per_second: Default::default(),
+            packets_per_second: Default::default(),
         }
     }
 
@@ -31,14 +65,32 @@ impl UnreliableSender {
         let total_fragments: u32 = bytes.len().div_ceil(chunk_size).try_into().unwrap();
 
         for (fragment_bytes, fragment_index) in bytes.chunks(chunk_size).zip(0u32..) {
-            let mut fragment = Vec::with_capacity(fragment_bytes.len() + HEADER_SIZE);
-            fragment.extend_from_slice(&self.packet_index.to_le_bytes());
-            fragment.extend_from_slice(&fragment_index.to_le_bytes());
-            fragment.extend_from_slice(&total_fragments.to_le_bytes());
+            let mut fragment = Vec::with_capacity(HEADER_SIZE + fragment_bytes.len());
+            let header = Header {
+                packet_index: self.packet_index,
+                fragment_index,
+                total_fragments,
+            };
+            self.fragments_per_second.tick();
+            trace!(
+                "Sending packet {} fragment {}/{} ({} bytes, {:.0}/s)",
+                self.packet_index,
+                fragment_index,
+                total_fragments,
+                fragment_bytes.len(),
+                self.fragments_per_second.avg()
+            );
+            header.write_to(&mut fragment).unwrap();
             fragment.extend_from_slice(fragment_bytes);
             self.packet_index += 1;
             self.conn.send_datagram(fragment.into()).unwrap();
         }
+        self.packets_per_second.tick();
+        trace!(
+            "Sent all fragments for packet {} ({:.0} packet/s)",
+            self.packet_index,
+            self.packets_per_second.avg()
+        );
         Ok(())
     }
 }
@@ -96,25 +148,27 @@ impl UnreliableReceiver {
             fragment_map,
             num_fragments_found,
         } = self;
-        let start = Instant::now();
-
         loop {
             let fragment = channel.recv().await?;
-            if fragment.len() >= HEADER_SIZE {
+            if fragment.len() < HEADER_SIZE {
                 warn!("Received fragment without header");
                 continue;
             }
-            let packet_index = u64::from_le_bytes(*fragment[0..8].as_array().unwrap());
-            let fragment_index = u32::from_le_bytes(*fragment[8..12].as_array().unwrap());
-            let total_fragments = u32::from_le_bytes(*fragment[12..16].as_array().unwrap());
-            let fragment_bytes = &fragment[16..];
-
-            fragments_per_second.tick();
-            trace!(
-                "Received packet {} fragment {}/{} ({:.0}/s)",
+            let header = Header::read_from(&fragment).unwrap();
+            let Header {
                 packet_index,
                 fragment_index,
                 total_fragments,
+            } = header;
+            let fragment_bytes = &fragment[HEADER_SIZE..];
+
+            fragments_per_second.tick();
+            trace!(
+                "Received packet {} fragment {}/{} ({} bytes, {:.0}/s)",
+                packet_index,
+                fragment_index,
+                total_fragments,
+                fragment_bytes.len(),
                 fragments_per_second.avg()
             );
             if fragment_index >= total_fragments {
@@ -148,7 +202,7 @@ impl UnreliableReceiver {
             *num_fragments_found = 0;
             packets_per_second.tick();
             trace!(
-                "Gathered all {} fragments for packet {} ({:.2}/s)",
+                "Gathered all {} fragments for packet {} ({:.2} packet/s)",
                 total_fragments,
                 packet_index,
                 packets_per_second.avg()
