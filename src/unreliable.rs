@@ -82,9 +82,9 @@ impl UnreliableSender {
             );
             header.write_to(&mut fragment).unwrap();
             fragment.extend_from_slice(fragment_bytes);
-            self.packet_index += 1;
             self.conn.send_datagram(fragment.into()).unwrap();
         }
+        self.packet_index += 1;
         self.packets_per_second.tick();
         trace!(
             "Sent all fragments for packet {} ({:.0} packet/s)",
@@ -182,6 +182,7 @@ impl UnreliableReceiver {
                 );
             }
             if packet_index > *current_packet_index || *num_fragments_found == 0 {
+                *num_fragments_found = 0;
                 fragment_map.clear();
                 fragment_map.extend(iter::repeat(Vec::new()).take(total_fragments as _));
                 *current_packet_index = packet_index;
