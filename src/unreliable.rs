@@ -1,7 +1,9 @@
 use std::{
+    collections::VecDeque,
     io::{self, Write},
     iter,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -116,13 +118,70 @@ pub enum RecvTimeoutError {
     Disconnected,
 }
 
-pub struct UnreliableReceiver {
-    channel: tokio::sync::mpsc::Receiver<Bytes>,
+struct RecvStatistics {
     fragments_per_second: fps_ticker::Fps,
     packets_per_second: fps_ticker::Fps,
+    last_100_packets: VecDeque<u64>,
+    last_statistics_logged_at: Instant,
+}
+
+impl RecvStatistics {
+    pub fn new() -> Self {
+        Self {
+            fragments_per_second: Default::default(),
+            packets_per_second: Default::default(),
+            last_100_packets: VecDeque::with_capacity(100),
+            last_statistics_logged_at: Instant::now(),
+        }
+    }
+
+    pub fn fragments_per_second(&self) -> f64 {
+        self.fragments_per_second.avg()
+    }
+
+    pub fn packets_per_second(&self) -> f64 {
+        self.packets_per_second.avg()
+    }
+
+    pub fn received_fragment(&mut self) {
+        self.fragments_per_second.tick();
+    }
+
+    pub fn received_packet(&mut self, packet_index: u64) {
+        let Self {
+            packets_per_second,
+            last_100_packets,
+            last_statistics_logged_at,
+            ..
+        } = self;
+        packets_per_second.tick();
+        if last_100_packets.len() >= 100 {
+            last_100_packets.pop_front();
+        }
+        last_100_packets.push_back(packet_index);
+        let now = Instant::now();
+        if now - *last_statistics_logged_at > Duration::from_secs(1) {
+            let first_packet = if last_100_packets.len() < 100 {
+                0
+            } else {
+                last_100_packets[0]
+            };
+            let last_packet = last_100_packets.back().unwrap();
+            info!(
+                "Recent packet loss: {:.1}%",
+                1.0 - (last_packet - first_packet) as f32 / last_100_packets.len() as f32
+            );
+            *last_statistics_logged_at = now;
+        }
+    }
+}
+
+pub struct UnreliableReceiver {
+    channel: tokio::sync::mpsc::Receiver<Bytes>,
     current_packet_index: u64,
     fragment_map: Vec<Vec<u8>>,
     num_fragments_found: u32,
+    statistics: RecvStatistics,
 }
 
 impl UnreliableReceiver {
@@ -131,22 +190,20 @@ impl UnreliableReceiver {
         tokio::task::spawn(receiver_task(conn, sender));
         Self {
             channel: receiver,
-            fragments_per_second: Default::default(),
-            packets_per_second: Default::default(),
             current_packet_index: 0,
             fragment_map: Vec::with_capacity(100),
             num_fragments_found: 0,
+            statistics: RecvStatistics::new(),
         }
     }
 
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
         let Self {
             channel,
-            fragments_per_second,
-            packets_per_second,
             current_packet_index,
             fragment_map,
             num_fragments_found,
+            statistics,
         } = self;
         loop {
             let fragment = channel.recv().await?;
@@ -162,14 +219,14 @@ impl UnreliableReceiver {
             } = header;
             let fragment_bytes = &fragment[HEADER_SIZE..];
 
-            fragments_per_second.tick();
+            statistics.received_fragment();
             trace!(
                 "Received packet {} fragment {}/{} ({} bytes, {:.0}/s)",
                 packet_index,
                 fragment_index,
                 total_fragments,
                 fragment_bytes.len(),
-                fragments_per_second.avg()
+                statistics.fragments_per_second()
             );
             if fragment_index >= total_fragments {
                 warn!("Invalid fragment header: fragment_index >= total_fragments");
@@ -199,14 +256,15 @@ impl UnreliableReceiver {
             if *num_fragments_found < total_fragments {
                 continue;
             }
-            *current_packet_index += 1;
+            *current_packet_index = packet_index;
             *num_fragments_found = 0;
-            packets_per_second.tick();
+
+            statistics.received_packet(packet_index);
             trace!(
                 "Gathered all {} fragments for packet {} ({:.2} packet/s)",
                 total_fragments,
                 packet_index,
-                packets_per_second.avg()
+                statistics.packets_per_second()
             );
             let packet_bytes = fragment_map.iter().flatten().copied().collect::<Vec<u8>>();
             return Some(packet_bytes);
