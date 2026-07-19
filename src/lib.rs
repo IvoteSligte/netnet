@@ -74,6 +74,7 @@ pub fn create_client(
         // TEMP: only for debugging
         .with_no_client_auth();
     crypto.alpn_protocols = vec![PROTOCOL_NAME.into()];
+    // TODO: transportconfig::keep_alive_interval
     let config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?));
 
     info!("Creating client endpoint");

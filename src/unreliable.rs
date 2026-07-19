@@ -167,6 +167,7 @@ impl RecvStatistics {
                 last_100_packets[0]
             };
             let last_packet = last_100_packets.back().unwrap();
+            // TODO: also report ping/RTT (conn.stats().path.rtt)
             info!(
                 "Recent packet loss: {:.1}%",
                 1.0 - (last_packet - first_packet) as f32 / last_100_packets.len() as f32
