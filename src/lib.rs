@@ -16,16 +16,16 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 mod average;
 pub mod error;
 mod insecure;
+pub mod reliable;
 pub mod unreliable;
 
-pub use unreliable::{UnreliableReceiver, UnreliableSender, RecvTimeoutError};
+pub use reliable::{ReliableReceiver, ReliableSender};
+pub use unreliable::{RecvTimeoutError, UnreliableReceiver, UnreliableSender};
 
 const SERVER_NAME: &str = "netnet-server";
 const PROTOCOL_NAME: &str = "netnet-protocol";
 
 pub use quinn::ConnectionError;
-
-// TODO: KEEPALIVE packets (probably on a reliable stream)
 
 /// Create using [create_client] or [create_server]
 pub struct Connection {
@@ -44,13 +44,34 @@ impl Connection {
         }
     }
 
-    /// Should not be used unless necessary
+    /// Creates a reliable, bidirectional stream
+    pub async fn create_reliable_stream(
+        &self,
+        id: u8,
+    ) -> anyhow::Result<(ReliableSender, ReliableReceiver)> {
+        let (mut sender, receiver) = self.conn.open_bi().await?;
+        sender.write(std::slice::from_ref(&id)).await?;
+        Ok((ReliableSender(sender), ReliableReceiver(receiver)))
+    }
+
+    /// Returns stream ID and the stream sender/receiver pair
+    pub async fn accept_reliable_stream(
+        &self,
+    ) -> anyhow::Result<(u8, ReliableSender, ReliableReceiver)> {
+        let (sender, mut receiver) = self.conn.accept_bi().await?;
+        let mut id = 0u8;
+        receiver.read(std::slice::from_mut(&mut id)).await?;
+        Ok((id, ReliableSender(sender), ReliableReceiver(receiver)))
+    }
+
+    /// Should not be used unless absolutely necessary
     pub fn inner(&self) -> &Arc<quinn::Connection> {
         &self.conn
     }
 }
 
 // TODO: reorder buffer? probably necessary to get smooth audio
+//       based on experimentation, only having a buffer for fragments of large packets is sufficient for video
 // TODO: forward error correction
 
 // TODO: allow loading cert and key from file
@@ -74,7 +95,7 @@ pub fn create_client(
         // TEMP: only for debugging
         .with_no_client_auth();
     crypto.alpn_protocols = vec![PROTOCOL_NAME.into()];
-    // TODO: transportconfig::keep_alive_interval
+    // TODO: set transportconfig::keep_alive_interval
     let config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?));
 
     info!("Creating client endpoint");

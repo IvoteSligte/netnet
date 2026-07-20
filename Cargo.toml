@@ -8,7 +8,7 @@ anyhow = "1.0.103"
 async-compat = "0.2.5"
 bytes = "1.12.1"
 crossbeam-queue = "0.3.13"
-fps_ticker = "1.0.0"
+fps_ticker = { version = "1.0.0", path = "../fps_ticker" }
 log = "0.4.33"
 quinn = "0.11.11"
 rcgen = "0.14.8"
