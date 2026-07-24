@@ -257,7 +257,7 @@ impl UnreliableReceiver {
             if *num_fragments_found < total_fragments {
                 continue;
             }
-            *current_packet_index = packet_index;
+            *current_packet_index = packet_index + 1;
             *num_fragments_found = 0;
 
             statistics.received_packet(packet_index);
