@@ -31,15 +31,16 @@ pub use quinn::ConnectionError;
 pub struct Connection {
     pub unreliable_sender: UnreliableSender,
     pub unreliable_receiver: UnreliableReceiver,
-    conn: Arc<quinn::Connection>,
+    _endpoint: quinn::Endpoint,
+    conn: quinn::Connection,
 }
 
 impl Connection {
-    pub(crate) fn new(conn: quinn::Connection) -> Self {
-        let conn = Arc::new(conn);
+    pub(crate) fn new(endpoint: quinn::Endpoint, conn: quinn::Connection) -> Self {
         Self {
-            unreliable_sender: UnreliableSender::new(conn.clone()),
-            unreliable_receiver: UnreliableReceiver::new(conn.clone()),
+            unreliable_sender: UnreliableSender::new(endpoint.clone(), conn.clone()),
+            unreliable_receiver: UnreliableReceiver::new(endpoint.clone(), conn.clone()),
+            _endpoint: endpoint,
             conn,
         }
     }
@@ -65,7 +66,7 @@ impl Connection {
     }
 
     /// Should not be used unless absolutely necessary
-    pub fn inner(&self) -> &Arc<quinn::Connection> {
+    pub fn inner(&self) -> &quinn::Connection {
         &self.conn
     }
 }
@@ -108,7 +109,7 @@ pub fn create_client(
     Ok(async move {
         info!("Connecting to server");
         let connecting = endpoint.connect(server_addr, SERVER_NAME)?;
-        Ok(Connection::new(connecting.await?))
+        Ok(Connection::new(endpoint, connecting.await?))
     })
 }
 
@@ -142,6 +143,6 @@ pub fn create_server(
             .await
             .ok_or(anyhow!("Connection closed while waiting for client"))?;
         info!("Accepted connection");
-        Ok(Connection::new(incoming.await?))
+        Ok(Connection::new(endpoint, incoming.await?))
     })
 }

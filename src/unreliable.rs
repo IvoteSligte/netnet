@@ -2,13 +2,11 @@ use std::{
     collections::VecDeque,
     io::{self, Write},
     iter,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
 use log::{debug, info, trace, warn};
-use quinn::Connection;
 use thiserror::Error;
 
 const HEADER_SIZE: usize = 8 + 4 + 4;
@@ -40,15 +38,17 @@ impl Header {
 }
 
 pub struct UnreliableSender {
-    conn: Arc<Connection>,
+    _endpoint: quinn::Endpoint,
+    conn: quinn::Connection,
     packet_index: u64,
     fragments_per_second: fps_ticker::Fps,
     packets_per_second: fps_ticker::Fps,
 }
 
 impl UnreliableSender {
-    pub fn new(conn: Arc<Connection>) -> Self {
+    pub fn new(endpoint: quinn::Endpoint, conn: quinn::Connection) -> Self {
         Self {
+            _endpoint: endpoint,
             conn,
             packet_index: 0,
             fragments_per_second: Default::default(),
@@ -94,19 +94,6 @@ impl UnreliableSender {
             self.packets_per_second.avg()
         );
         Ok(())
-    }
-}
-
-async fn receiver_task(
-    conn: Arc<Connection>,
-    channel: tokio::sync::mpsc::Sender<Bytes>,
-) -> Result<(), quinn::ConnectionError> {
-    loop {
-        let bytes = conn.read_datagram().await?;
-        if let Err(_) = channel.send(bytes).await {
-            info!("Receiver channel closed");
-            break Ok(());
-        }
     }
 }
 
@@ -186,9 +173,18 @@ pub struct UnreliableReceiver {
 }
 
 impl UnreliableReceiver {
-    pub fn new(conn: Arc<Connection>) -> Self {
+    pub fn new(endpoint: quinn::Endpoint, conn: quinn::Connection) -> Self {
         let (sender, receiver) = tokio::sync::mpsc::channel(100);
-        tokio::task::spawn(receiver_task(conn, sender));
+        tokio::task::spawn(async move {
+            loop {
+                let bytes = conn.read_datagram().await.unwrap();
+                if let Err(_) = sender.send(bytes).await {
+                    warn!("Receiver channel closed");
+                    break;
+                }
+            }
+            drop(endpoint);
+        });
         Self {
             channel: receiver,
             current_packet_index: 0,
@@ -198,6 +194,7 @@ impl UnreliableReceiver {
         }
     }
 
+    /// Returns `None` if the connection is closed
     pub async fn recv(&mut self) -> Option<Vec<u8>> {
         let Self {
             channel,
