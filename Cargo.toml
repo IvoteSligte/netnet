@@ -2,6 +2,7 @@
 name = "netnet"
 version = "0.1.0"
 edition = "2024"
+description = "High-level networking library built on Quinn and Tokio"
 
 [dependencies]
 anyhow = "1.0.103"
