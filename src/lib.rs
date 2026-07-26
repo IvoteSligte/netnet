@@ -65,6 +65,12 @@ impl Connection {
         Ok((id, ReliableSender(sender), ReliableReceiver(receiver)))
     }
 
+    /// Closes the connection with a `NO_ERROR` error code and the given `reason`.
+    /// Consider using a byte string `b"Reason"` to provide a human-readable reason.
+    pub fn close(&self, reason: &[u8]) {
+        self.conn.close(quinn::VarInt::from_u32(0x0), reason);
+    }
+    
     /// Should not be used unless absolutely necessary
     pub fn inner(&self) -> &quinn::Connection {
         &self.conn
