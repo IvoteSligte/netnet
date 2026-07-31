@@ -9,13 +9,14 @@ use bytes::Bytes;
 use log::{debug, info, trace, warn};
 use thiserror::Error;
 
-const HEADER_SIZE: usize = 8 + 4 + 4;
+const HEADER_SIZE: usize = 8 + 4 + 4 + 1;
 
 #[derive(Debug)]
 struct Header {
     pub packet_index: u64,
     pub fragment_index: u32,
     pub total_fragments: u32,
+    pub stream_id: u8,
 }
 
 impl Header {
@@ -24,6 +25,7 @@ impl Header {
         num_bytes += writer.write(&self.packet_index.to_le_bytes())?;
         num_bytes += writer.write(&self.fragment_index.to_le_bytes())?;
         num_bytes += writer.write(&self.total_fragments.to_le_bytes())?;
+        num_bytes += writer.write(&[self.stream_id])?;
         assert_eq!(num_bytes, HEADER_SIZE);
         Ok(())
     }
@@ -33,6 +35,7 @@ impl Header {
             packet_index: u64::from_le_bytes(*buf[0..8].as_array().unwrap()),
             fragment_index: u32::from_le_bytes(*buf[8..12].as_array().unwrap()),
             total_fragments: u32::from_le_bytes(*buf[12..16].as_array().unwrap()),
+            stream_id: buf[16],
         })
     }
 }
@@ -40,16 +43,18 @@ impl Header {
 pub struct UnreliableSender {
     _endpoint: quinn::Endpoint,
     conn: quinn::Connection,
+    stream_id: u8,
     packet_index: u64,
     fragments_per_second: fps_ticker::Fps,
     packets_per_second: fps_ticker::Fps,
 }
 
 impl UnreliableSender {
-    pub fn new(endpoint: quinn::Endpoint, conn: quinn::Connection) -> Self {
+    pub fn new(endpoint: quinn::Endpoint, conn: quinn::Connection, stream_id: u8) -> Self {
         Self {
             _endpoint: endpoint,
             conn,
+            stream_id,
             packet_index: 0,
             fragments_per_second: Default::default(),
             packets_per_second: Default::default(),
@@ -72,6 +77,7 @@ impl UnreliableSender {
                 packet_index: self.packet_index,
                 fragment_index,
                 total_fragments,
+                stream_id: self.stream_id,
             };
             self.fragments_per_second.tick();
             trace!(
@@ -164,6 +170,27 @@ impl RecvStatistics {
     }
 }
 
+pub(crate) fn spawn_unreliable_receivers(
+    endpoint: quinn::Endpoint,
+    conn: quinn::Connection,
+) -> Vec<tokio::sync::mpsc::Receiver<Bytes>> {
+    let (senders, receivers): (Vec<_>, Vec<_>) = (0..u8::MAX)
+        .map(|_| tokio::sync::mpsc::channel(100))
+        .unzip();
+    tokio::task::spawn(async move {
+        loop {
+            let bytes = conn.read_datagram().await.unwrap();
+            let header = Header::read_from(&bytes).unwrap();
+            if let Err(_) = senders[header.stream_id as usize].send(bytes).await {
+                warn!("Receiver channel closed");
+                break;
+            }
+        }
+        drop(endpoint);
+    });
+    receivers
+}
+
 pub struct UnreliableReceiver {
     channel: tokio::sync::mpsc::Receiver<Bytes>,
     current_packet_index: u64,
@@ -173,20 +200,9 @@ pub struct UnreliableReceiver {
 }
 
 impl UnreliableReceiver {
-    pub fn new(endpoint: quinn::Endpoint, conn: quinn::Connection) -> Self {
-        let (sender, receiver) = tokio::sync::mpsc::channel(100);
-        tokio::task::spawn(async move {
-            loop {
-                let bytes = conn.read_datagram().await.unwrap();
-                if let Err(_) = sender.send(bytes).await {
-                    warn!("Receiver channel closed");
-                    break;
-                }
-            }
-            drop(endpoint);
-        });
+    pub fn new(channel: tokio::sync::mpsc::Receiver<Bytes>) -> Self {
         Self {
-            channel: receiver,
+            channel,
             current_packet_index: 0,
             fragment_map: Vec::with_capacity(100),
             num_fragments_found: 0,
@@ -214,6 +230,7 @@ impl UnreliableReceiver {
                 packet_index,
                 fragment_index,
                 total_fragments,
+                stream_id: _,
             } = header;
             let fragment_bytes = &fragment[HEADER_SIZE..];
 
