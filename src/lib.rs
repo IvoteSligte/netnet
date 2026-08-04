@@ -2,16 +2,14 @@ use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv6Addr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{anyhow, bail};
 pub use error::{Error, Result};
 use insecure::SkipServerVerification;
 use log::info;
-use quinn::{
-    ClientConfig,
-    crypto::rustls::{QuicClientConfig, QuicServerConfig},
-};
+use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 mod average;
@@ -154,6 +152,14 @@ fn generate_self_signed_cert() -> anyhow::Result<(CertificateDer<'static>, Priva
     Ok((cert_der, key))
 }
 
+fn default_transport_config() -> quinn::TransportConfig {
+    let mut config = quinn::TransportConfig::default();
+    config.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(Duration::from_secs(60)).unwrap(),
+    ));
+    config
+}
+
 /// Arbitrary number used to indicate control stream initialization.
 /// A value that is unlikely to occur in random data was chosen.
 const CONTROL_STREAM_INIT: u8 = 177;
@@ -169,8 +175,8 @@ pub fn create_client(
         // TEMP: only for debugging
         .with_no_client_auth();
     crypto.alpn_protocols = vec![PROTOCOL_NAME.into()];
-    // TODO: set transportconfig::keep_alive_interval
-    let config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?));
+    let mut config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?));
+    config.transport_config(Arc::new(default_transport_config()));
 
     info!("Creating client endpoint");
     let mut endpoint =
@@ -205,8 +211,7 @@ pub fn create_server(
 
     let mut server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(crypto)?));
-    let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
-    transport_config.max_concurrent_uni_streams(0_u8.into());
+    server_config.transport_config(Arc::new(default_transport_config()));
 
     info!("Creating server endpoint");
     let endpoint = quinn::Endpoint::server(
