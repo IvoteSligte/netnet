@@ -9,13 +9,14 @@ use bytes::Bytes;
 use log::{debug, info, trace, warn};
 use thiserror::Error;
 
-const HEADER_SIZE: usize = 8 + 4 + 4 + 1;
+const HEADER_SIZE: usize = 8 + 4 + 4 + 2 + 1;
 
 #[derive(Debug)]
 struct Header {
     pub packet_index: u64,
     pub fragment_index: u32,
     pub total_fragments: u32,
+    pub max_fragment_size: u16,
     pub stream_id: u8,
 }
 
@@ -25,6 +26,7 @@ impl Header {
         num_bytes += writer.write(&self.packet_index.to_le_bytes())?;
         num_bytes += writer.write(&self.fragment_index.to_le_bytes())?;
         num_bytes += writer.write(&self.total_fragments.to_le_bytes())?;
+        num_bytes += writer.write(&self.max_fragment_size.to_le_bytes())?;
         num_bytes += writer.write(&[self.stream_id])?;
         assert_eq!(num_bytes, HEADER_SIZE);
         Ok(())
@@ -35,7 +37,8 @@ impl Header {
             packet_index: u64::from_le_bytes(*buf[0..8].as_array().unwrap()),
             fragment_index: u32::from_le_bytes(*buf[8..12].as_array().unwrap()),
             total_fragments: u32::from_le_bytes(*buf[12..16].as_array().unwrap()),
-            stream_id: buf[16],
+            max_fragment_size: u16::from_le_bytes(*buf[16..18].as_array().unwrap()),
+            stream_id: buf[18],
         })
     }
 }
@@ -68,15 +71,20 @@ impl UnreliableSender {
     /// There is no restriction on the size of [bytes], however,
     /// the chance of the receiver receiving the packet in its entirety decreases with size.
     pub fn send(&mut self, bytes: &[u8]) -> Result<(), quinn::SendDatagramError> {
-        let chunk_size = self.conn.max_datagram_size().unwrap() - HEADER_SIZE;
-        let total_fragments: u32 = bytes.len().div_ceil(chunk_size).try_into().unwrap();
+        let max_fragment_size = (self.conn.max_datagram_size().unwrap() - HEADER_SIZE) as u16;
+        let total_fragments: u32 = bytes
+            .len()
+            .div_ceil(max_fragment_size as _)
+            .try_into()
+            .unwrap();
 
-        for (fragment_bytes, fragment_index) in bytes.chunks(chunk_size).zip(0u32..) {
+        for (fragment_bytes, fragment_index) in bytes.chunks(max_fragment_size as _).zip(0u32..) {
             let mut fragment = Vec::with_capacity(HEADER_SIZE + fragment_bytes.len());
             let header = Header {
                 packet_index: self.packet_index,
                 fragment_index,
                 total_fragments,
+                max_fragment_size,
                 stream_id: self.stream_id,
             };
             self.fragments_per_second.tick();
@@ -194,7 +202,8 @@ pub(crate) fn spawn_unreliable_receivers(
 pub struct UnreliableReceiver {
     channel: tokio::sync::mpsc::Receiver<Bytes>,
     current_packet_index: u64,
-    fragment_map: Vec<Vec<u8>>,
+    packet_bytes: Vec<u8>,
+    fragment_mask: Vec<bool>,
     num_fragments_found: u32,
     statistics: RecvStatistics,
 }
@@ -204,18 +213,20 @@ impl UnreliableReceiver {
         Self {
             channel,
             current_packet_index: 0,
-            fragment_map: Vec::with_capacity(100),
+            packet_bytes: Vec::with_capacity(10_000),
+            fragment_mask: Vec::with_capacity(100),
             num_fragments_found: 0,
             statistics: RecvStatistics::new(),
         }
     }
 
     /// Returns `None` if the connection is closed
-    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+    pub async fn recv(&mut self) -> Option<&[u8]> {
         let Self {
             channel,
             current_packet_index,
-            fragment_map,
+            packet_bytes,
+            fragment_mask,
             num_fragments_found,
             statistics,
         } = self;
@@ -230,6 +241,7 @@ impl UnreliableReceiver {
                 packet_index,
                 fragment_index,
                 total_fragments,
+                max_fragment_size,
                 stream_id: _,
             } = header;
             let fragment_bytes = &fragment[HEADER_SIZE..];
@@ -255,25 +267,38 @@ impl UnreliableReceiver {
             }
             if packet_index > *current_packet_index || *num_fragments_found == 0 {
                 *num_fragments_found = 0;
-                fragment_map.clear();
-                fragment_map.extend(iter::repeat(Vec::new()).take(total_fragments as _));
+                packet_bytes.clear();
+                packet_bytes.extend(
+                    iter::repeat(0u8).take(total_fragments as usize * max_fragment_size as usize),
+                );
+                for _ in fragment_mask.len()..total_fragments as usize {
+                    fragment_mask.push(false);
+                }
+                fragment_mask.fill(false);
                 *current_packet_index = packet_index;
             }
-            debug_assert!(fragment_index < total_fragments);
-            debug_assert!(total_fragments as usize == fragment_map.len());
-
-            if !fragment_map[fragment_index as usize].is_empty() {
+            if fragment_mask[fragment_index as usize] {
                 trace!("Duplicate fragment {}", fragment_index);
                 continue;
             }
-            fragment_map[fragment_index as usize] = fragment_bytes.to_vec();
+            if fragment_index + 1 == total_fragments {
+                // Truncate the size of packet_bytes from a generous guess to the actual bounds.
+                let len = (total_fragments - 1) as usize * max_fragment_size as usize
+                    + fragment_bytes.len();
+                packet_bytes.truncate(len);
+            }
+            fragment_mask[fragment_index as usize] = true;
+            {
+                let start = fragment_index as usize * max_fragment_size as usize;
+                let end = start + fragment_bytes.len();
+                packet_bytes[start..end].copy_from_slice(fragment_bytes);
+            }
             *num_fragments_found += 1;
             if *num_fragments_found < total_fragments {
                 continue;
             }
             *current_packet_index = packet_index + 1;
             *num_fragments_found = 0;
-
             statistics.received_packet(packet_index);
             trace!(
                 "Gathered all {} fragments for packet {} ({:.2} packet/s)",
@@ -281,8 +306,7 @@ impl UnreliableReceiver {
                 packet_index,
                 statistics.packets_per_second()
             );
-            let packet_bytes = fragment_map.iter().flatten().copied().collect::<Vec<u8>>();
-            return Some(packet_bytes);
+            return Some(packet_bytes.as_slice());
         }
     }
 }

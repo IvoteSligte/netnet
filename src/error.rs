@@ -27,7 +27,6 @@ pub enum Error {
 
     #[error(transparent)]
     Rustls(#[from] rustls::Error),
-
     // #[error(transparent)]
     // Quinn(#[from] quinn::),
 }

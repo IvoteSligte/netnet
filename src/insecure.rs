@@ -1,6 +1,11 @@
 use std::sync::Arc;
 
-use rustls::{DigitallySignedStruct, SignatureScheme, client::danger, crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature}, pki_types::{CertificateDer, ServerName, UnixTime}};
+use rustls::{
+    DigitallySignedStruct, SignatureScheme,
+    client::danger,
+    crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature},
+    pki_types::{CertificateDer, ServerName, UnixTime},
+};
 
 // Implementation of `ServerCertVerifier` that verifies everything as trustworthy.
 #[derive(Debug)]
