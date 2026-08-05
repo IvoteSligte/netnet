@@ -1,11 +1,10 @@
 use std::{
     collections::VecDeque,
-    io::{self, Write},
-    iter,
+    io, iter,
     time::{Duration, Instant},
 };
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use log::{debug, info, trace, warn};
 use thiserror::Error;
 
@@ -21,15 +20,12 @@ struct Header {
 }
 
 impl Header {
-    pub fn write_to(&self, writer: &mut impl Write) -> io::Result<()> {
-        let mut num_bytes = 0;
-        num_bytes += writer.write(&self.packet_index.to_le_bytes())?;
-        num_bytes += writer.write(&self.fragment_index.to_le_bytes())?;
-        num_bytes += writer.write(&self.total_fragments.to_le_bytes())?;
-        num_bytes += writer.write(&self.max_fragment_size.to_le_bytes())?;
-        num_bytes += writer.write(&[self.stream_id])?;
-        assert_eq!(num_bytes, HEADER_SIZE);
-        Ok(())
+    pub fn write_to(&self, bytes: &mut BytesMut) {
+        bytes.put_u64_le(self.packet_index);
+        bytes.put_u32_le(self.fragment_index);
+        bytes.put_u32_le(self.total_fragments);
+        bytes.put_u16_le(self.max_fragment_size);
+        bytes.put_u8(self.stream_id);
     }
 
     pub fn read_from(buf: &[u8]) -> io::Result<Self> {
@@ -43,11 +39,27 @@ impl Header {
     }
 }
 
+struct Alloc {
+    last_used: Instant,
+    bytes: Bytes,
+}
+
+impl Alloc {
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_unique(&self) -> bool {
+        self.bytes.is_unique()
+    }
+}
+
 pub struct UnreliableSender {
     _endpoint: quinn::Endpoint,
     conn: quinn::Connection,
     stream_id: u8,
     packet_index: u64,
+    alloc_pool: Vec<Alloc>,
     fragments_per_second: fps_ticker::Fps,
     packets_per_second: fps_ticker::Fps,
 }
@@ -59,6 +71,7 @@ impl UnreliableSender {
             conn,
             stream_id,
             packet_index: 0,
+            alloc_pool: Vec::new(),
             fragments_per_second: Default::default(),
             packets_per_second: Default::default(),
         }
@@ -66,6 +79,39 @@ impl UnreliableSender {
 
     pub fn max_fragment_size(&self) -> usize {
         self.conn.max_datagram_size().unwrap()
+    }
+
+    fn get_alloc(&mut self, size: usize) -> BytesMut {
+        match self
+            .alloc_pool
+            .iter()
+            .position(|alloc| alloc.is_unique() && alloc.len() >= size)
+        {
+            Some(index) => {
+                let mut alloc = self
+                    .alloc_pool
+                    .swap_remove(index)
+                    .bytes
+                    .try_into_mut()
+                    .unwrap();
+                alloc.clear();
+                alloc
+            }
+            None => {
+                debug!(
+                    "Created new allocation of size {size} ({} in pool)",
+                    self.alloc_pool.len()
+                );
+                // Not sure why, but without something to remove old allocations,
+                // the pool keeps growing seemingly forever.
+                // Perhaps a crate that quinn depends on also checks for allocation
+                // uniqueness in a pool (because quinn itself does not seem to).
+                let now = Instant::now();
+                self.alloc_pool
+                    .retain(|alloc| now - alloc.last_used < Duration::from_secs(5));
+                BytesMut::with_capacity(size)
+            }
+        }
     }
 
     /// There is no restriction on the size of [bytes], however,
@@ -77,9 +123,8 @@ impl UnreliableSender {
             .div_ceil(max_fragment_size as _)
             .try_into()
             .unwrap();
-
         for (fragment_bytes, fragment_index) in bytes.chunks(max_fragment_size as _).zip(0u32..) {
-            let mut fragment = Vec::with_capacity(HEADER_SIZE + fragment_bytes.len());
+            let mut fragment = self.get_alloc(HEADER_SIZE + fragment_bytes.len());
             let header = Header {
                 packet_index: self.packet_index,
                 fragment_index,
@@ -96,9 +141,16 @@ impl UnreliableSender {
                 fragment_bytes.len(),
                 self.fragments_per_second.avg()
             );
-            header.write_to(&mut fragment).unwrap();
+            header.write_to(&mut fragment);
             fragment.extend_from_slice(fragment_bytes);
-            self.conn.send_datagram(fragment.into()).unwrap();
+            // The fragment's backing memory is frozen and pushed to the pool,
+            // so that it can be reused as soon as quinn is done with it.
+            let fragment = fragment.freeze();
+            self.conn.send_datagram(fragment.clone()).unwrap();
+            self.alloc_pool.push(Alloc {
+                last_used: Instant::now(),
+                bytes: fragment,
+            });
         }
         self.packet_index += 1;
         self.packets_per_second.tick();
