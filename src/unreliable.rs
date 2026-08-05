@@ -54,14 +54,65 @@ impl Alloc {
     }
 }
 
+struct SendStatistics {
+    stream_id: u8,
+    packets_in_last_second: Vec<(Instant, usize)>,
+    fragments_per_second: fps_ticker::Fps,
+    packets_per_second: fps_ticker::Fps,
+    last_logged_at: Instant,
+}
+
+impl SendStatistics {
+    pub fn new(stream_id: u8) -> Self {
+        Self {
+            stream_id,
+            packets_in_last_second: Vec::with_capacity(100),
+            fragments_per_second: Default::default(),
+            packets_per_second: Default::default(),
+            last_logged_at: Instant::now(),
+        }
+    }
+
+    pub fn fragments_per_second(&self) -> f64 {
+        self.fragments_per_second.avg()
+    }
+
+    pub fn packets_per_second(&self) -> f64 {
+        self.packets_per_second.avg()
+    }
+
+    pub fn sent_fragment(&mut self) {
+        self.fragments_per_second.tick();
+    }
+
+    pub fn sent_packet(&mut self, packet_size: usize) {
+        let Self {
+            stream_id,
+            packets_in_last_second,
+            packets_per_second,
+            last_logged_at,
+            ..
+        } = self;
+        packets_per_second.tick();
+        let now = Instant::now();
+        packets_in_last_second.retain(|(sent_at, _)| now - *sent_at < Duration::from_secs(1));
+        packets_in_last_second.push((now, packet_size));
+        if now - *last_logged_at > Duration::from_secs(1) {
+            *last_logged_at = now;
+            let bytes_in_last_second: usize =
+                packets_in_last_second.iter().map(|(_, size)| *size).sum();
+            info!("{stream_id}: bytes/s: {bytes_in_last_second}");
+        }
+    }
+}
+
 pub struct UnreliableSender {
     _endpoint: quinn::Endpoint,
     conn: quinn::Connection,
     stream_id: u8,
     packet_index: u64,
     alloc_pool: Vec<Alloc>,
-    fragments_per_second: fps_ticker::Fps,
-    packets_per_second: fps_ticker::Fps,
+    stats: SendStatistics,
 }
 
 impl UnreliableSender {
@@ -71,9 +122,8 @@ impl UnreliableSender {
             conn,
             stream_id,
             packet_index: 0,
-            alloc_pool: Vec::new(),
-            fragments_per_second: Default::default(),
-            packets_per_second: Default::default(),
+            alloc_pool: Vec::with_capacity(100),
+            stats: SendStatistics::new(stream_id),
         }
     }
 
@@ -124,7 +174,8 @@ impl UnreliableSender {
             .try_into()
             .unwrap();
         for (fragment_bytes, fragment_index) in bytes.chunks(max_fragment_size as _).zip(0u32..) {
-            let mut fragment = self.get_alloc(HEADER_SIZE + fragment_bytes.len());
+            let fragment_size = HEADER_SIZE + fragment_bytes.len();
+            let mut fragment = self.get_alloc(fragment_size);
             let header = Header {
                 packet_index: self.packet_index,
                 fragment_index,
@@ -132,14 +183,14 @@ impl UnreliableSender {
                 max_fragment_size,
                 stream_id: self.stream_id,
             };
-            self.fragments_per_second.tick();
+            self.stats.sent_fragment();
             trace!(
                 "Sending packet {} fragment {}/{} ({} bytes, {:.0}/s)",
                 self.packet_index,
                 fragment_index,
                 total_fragments,
                 fragment_bytes.len(),
-                self.fragments_per_second.avg()
+                self.stats.fragments_per_second()
             );
             header.write_to(&mut fragment);
             fragment.extend_from_slice(fragment_bytes);
@@ -153,12 +204,13 @@ impl UnreliableSender {
             });
         }
         self.packet_index += 1;
-        self.packets_per_second.tick();
         trace!(
             "Sent all fragments for packet {} ({:.0} packet/s)",
             self.packet_index,
-            self.packets_per_second.avg()
+            self.stats.packets_per_second()
         );
+        self.stats
+            .sent_packet(total_fragments as usize * HEADER_SIZE + bytes.len());
         Ok(())
     }
 }
@@ -175,7 +227,7 @@ struct RecvStatistics {
     fragments_per_second: fps_ticker::Fps,
     packets_per_second: fps_ticker::Fps,
     last_100_packets: VecDeque<u64>,
-    last_statistics_logged_at: Instant,
+    last_logged_at: Instant,
 }
 
 impl RecvStatistics {
@@ -184,7 +236,7 @@ impl RecvStatistics {
             fragments_per_second: Default::default(),
             packets_per_second: Default::default(),
             last_100_packets: VecDeque::with_capacity(100),
-            last_statistics_logged_at: Instant::now(),
+            last_logged_at: Instant::now(),
         }
     }
 
@@ -204,7 +256,7 @@ impl RecvStatistics {
         let Self {
             packets_per_second,
             last_100_packets,
-            last_statistics_logged_at,
+            last_logged_at: last_statistics_logged_at,
             ..
         } = self;
         packets_per_second.tick();
