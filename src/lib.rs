@@ -49,7 +49,7 @@ impl Connection {
         let receivers = spawn_unreliable_receivers(endpoint.clone(), conn.clone())
             .into_iter()
             .enumerate()
-            .map(|(i, channel)| UnreliableReceiver::new(i, channel));
+            .map(|(i, channel)| UnreliableReceiver::new(i, "<no label>", channel));
 
         Self {
             _endpoint: endpoint,
@@ -93,13 +93,15 @@ impl Connection {
     pub async fn create_unreliable_stream(
         &mut self,
         id: u8,
+        label: &'static str,
     ) -> anyhow::Result<(UnreliableSender, UnreliableReceiver)> {
         info!("Creating unreliable stream with ID {id}");
-        let receiver = self
+        let mut receiver = self
             .unreliable_receivers
             .remove(&id)
             .ok_or_else(|| anyhow!("Unreliable stream ID {id} is already taken"))?;
-        let sender = UnreliableSender::new(self._endpoint.clone(), self.conn.clone(), id);
+        receiver.label = label;
+        let sender = UnreliableSender::new(self._endpoint.clone(), self.conn.clone(), id, label);
         self.control_stream.0.write(&[id]).await?;
         Ok((sender, receiver))
     }
@@ -119,7 +121,12 @@ impl Connection {
             .await?;
         match self.unreliable_receivers.remove(&id) {
             Some(receiver) => {
-                let sender = UnreliableSender::new(self._endpoint.clone(), self.conn.clone(), id);
+                let sender = UnreliableSender::new(
+                    self._endpoint.clone(),
+                    self.conn.clone(),
+                    id,
+                    "<unknown>",
+                );
                 info!("Accepted unreliable stream with ID {id}");
                 return Ok((id, sender, receiver));
             }

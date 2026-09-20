@@ -56,6 +56,7 @@ impl Alloc {
 
 struct SendStatistics {
     stream_id: u8,
+    label: &'static str,
     packets_in_last_second: Vec<(Instant, usize)>,
     fragments_per_second: fps_ticker::Fps,
     packets_per_second: fps_ticker::Fps,
@@ -63,9 +64,10 @@ struct SendStatistics {
 }
 
 impl SendStatistics {
-    pub fn new(stream_id: u8) -> Self {
+    pub fn new(stream_id: u8, label: &'static str) -> Self {
         Self {
             stream_id,
+            label,
             packets_in_last_second: Vec::with_capacity(100),
             fragments_per_second: Default::default(),
             packets_per_second: Default::default(),
@@ -88,6 +90,7 @@ impl SendStatistics {
     pub fn sent_packet(&mut self, packet_size: usize) {
         let Self {
             stream_id,
+            label,
             packets_in_last_second,
             packets_per_second,
             last_logged_at,
@@ -101,7 +104,7 @@ impl SendStatistics {
             *last_logged_at = now;
             let bytes_in_last_second: usize =
                 packets_in_last_second.iter().map(|(_, size)| *size).sum();
-            info!("{stream_id}: sent bytes/s: {bytes_in_last_second}");
+            info!("{stream_id} ({label}): sent bytes/s: {bytes_in_last_second}");
         }
     }
 }
@@ -113,17 +116,24 @@ pub struct UnreliableSender {
     packet_index: u64,
     alloc_pool: Vec<Alloc>,
     stats: SendStatistics,
+    pub label: &'static str,
 }
 
 impl UnreliableSender {
-    pub fn new(endpoint: quinn::Endpoint, conn: quinn::Connection, stream_id: u8) -> Self {
+    pub fn new(
+        endpoint: quinn::Endpoint,
+        conn: quinn::Connection,
+        stream_id: u8,
+        label: &'static str,
+    ) -> Self {
         Self {
             _endpoint: endpoint,
             conn,
             stream_id,
+            label,
             packet_index: 0,
             alloc_pool: Vec::with_capacity(100),
-            stats: SendStatistics::new(stream_id),
+            stats: SendStatistics::new(stream_id, label),
         }
     }
 
@@ -225,17 +235,19 @@ pub enum RecvTimeoutError {
 
 struct RecvStatistics {
     stream_id: usize,
+    label: &'static str,
     fragments_per_second: fps_ticker::Fps,
     packets_per_second: fps_ticker::Fps,
-    packets_in_last_second: Vec<(Instant, usize)>,    
+    packets_in_last_second: Vec<(Instant, usize)>,
     last_100_packets: VecDeque<u64>,
     last_logged_at: Instant,
 }
 
 impl RecvStatistics {
-    pub fn new(stream_id: usize) -> Self {
+    pub fn new(stream_id: usize, label: &'static str) -> Self {
         Self {
             stream_id,
+            label,
             fragments_per_second: Default::default(),
             packets_per_second: Default::default(),
             packets_in_last_second: Vec::new(),
@@ -259,6 +271,7 @@ impl RecvStatistics {
     pub fn received_packet(&mut self, packet_index: u64, packet_size: usize) {
         let Self {
             stream_id,
+            label,
             packets_per_second,
             last_100_packets,
             last_logged_at: last_statistics_logged_at,
@@ -287,7 +300,7 @@ impl RecvStatistics {
             );
             let bytes_in_last_second: usize =
                 packets_in_last_second.iter().map(|(_, size)| *size).sum();
-            info!("{stream_id}: received bytes/s: {bytes_in_last_second}");
+            info!("{stream_id} ({label}): received bytes/s: {bytes_in_last_second}");
             *last_statistics_logged_at = now;
         }
     }
@@ -321,17 +334,23 @@ pub struct UnreliableReceiver {
     fragment_mask: Vec<bool>,
     num_fragments_found: u32,
     statistics: RecvStatistics,
+    pub label: &'static str,
 }
 
 impl UnreliableReceiver {
-    pub fn new(stream_id: usize, channel: tokio::sync::mpsc::Receiver<Bytes>) -> Self {
+    pub fn new(
+        stream_id: usize,
+        label: &'static str,
+        channel: tokio::sync::mpsc::Receiver<Bytes>,
+    ) -> Self {
         Self {
             channel,
             current_packet_index: 0,
             packet_bytes: Vec::with_capacity(10_000),
             fragment_mask: Vec::with_capacity(100),
             num_fragments_found: 0,
-            statistics: RecvStatistics::new(stream_id),
+            statistics: RecvStatistics::new(stream_id, label),
+            label: "",
         }
     }
 
@@ -344,6 +363,7 @@ impl UnreliableReceiver {
             fragment_mask,
             num_fragments_found,
             statistics,
+            ..
         } = self;
         loop {
             let fragment = channel.recv().await?;
