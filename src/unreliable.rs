@@ -101,7 +101,7 @@ impl SendStatistics {
             *last_logged_at = now;
             let bytes_in_last_second: usize =
                 packets_in_last_second.iter().map(|(_, size)| *size).sum();
-            info!("{stream_id}: bytes/s: {bytes_in_last_second}");
+            info!("{stream_id}: sent bytes/s: {bytes_in_last_second}");
         }
     }
 }
@@ -224,17 +224,21 @@ pub enum RecvTimeoutError {
 }
 
 struct RecvStatistics {
+    stream_id: usize,
     fragments_per_second: fps_ticker::Fps,
     packets_per_second: fps_ticker::Fps,
+    packets_in_last_second: Vec<(Instant, usize)>,    
     last_100_packets: VecDeque<u64>,
     last_logged_at: Instant,
 }
 
 impl RecvStatistics {
-    pub fn new() -> Self {
+    pub fn new(stream_id: usize) -> Self {
         Self {
+            stream_id,
             fragments_per_second: Default::default(),
             packets_per_second: Default::default(),
+            packets_in_last_second: Vec::new(),
             last_100_packets: VecDeque::with_capacity(100),
             last_logged_at: Instant::now(),
         }
@@ -252,11 +256,13 @@ impl RecvStatistics {
         self.fragments_per_second.tick();
     }
 
-    pub fn received_packet(&mut self, packet_index: u64) {
+    pub fn received_packet(&mut self, packet_index: u64, packet_size: usize) {
         let Self {
+            stream_id,
             packets_per_second,
             last_100_packets,
             last_logged_at: last_statistics_logged_at,
+            packets_in_last_second,
             ..
         } = self;
         packets_per_second.tick();
@@ -265,6 +271,8 @@ impl RecvStatistics {
         }
         last_100_packets.push_back(packet_index);
         let now = Instant::now();
+        packets_in_last_second.retain(|(sent_at, _)| now - *sent_at < Duration::from_secs(1));
+        packets_in_last_second.push((now, packet_size));
         if now - *last_statistics_logged_at > Duration::from_secs(1) {
             let first_packet = if last_100_packets.len() < 100 {
                 0
@@ -277,6 +285,9 @@ impl RecvStatistics {
                 "Recent packet loss: {:.1}%",
                 1.0 - (last_packet - first_packet) as f32 / last_100_packets.len() as f32
             );
+            let bytes_in_last_second: usize =
+                packets_in_last_second.iter().map(|(_, size)| *size).sum();
+            info!("{stream_id}: received bytes/s: {bytes_in_last_second}");
             *last_statistics_logged_at = now;
         }
     }
@@ -313,14 +324,14 @@ pub struct UnreliableReceiver {
 }
 
 impl UnreliableReceiver {
-    pub fn new(channel: tokio::sync::mpsc::Receiver<Bytes>) -> Self {
+    pub fn new(stream_id: usize, channel: tokio::sync::mpsc::Receiver<Bytes>) -> Self {
         Self {
             channel,
             current_packet_index: 0,
             packet_bytes: Vec::with_capacity(10_000),
             fragment_mask: Vec::with_capacity(100),
             num_fragments_found: 0,
-            statistics: RecvStatistics::new(),
+            statistics: RecvStatistics::new(stream_id),
         }
     }
 
@@ -403,7 +414,7 @@ impl UnreliableReceiver {
             }
             *current_packet_index = packet_index + 1;
             *num_fragments_found = 0;
-            statistics.received_packet(packet_index);
+            statistics.received_packet(packet_index, packet_bytes.len());
             trace!(
                 "Gathered all {} fragments for packet {} ({:.2} packet/s)",
                 total_fragments,

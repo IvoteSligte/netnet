@@ -48,7 +48,8 @@ impl Connection {
     ) -> Self {
         let receivers = spawn_unreliable_receivers(endpoint.clone(), conn.clone())
             .into_iter()
-            .map(|channel| UnreliableReceiver::new(channel));
+            .enumerate()
+            .map(|(i, channel)| UnreliableReceiver::new(i, channel));
 
         Self {
             _endpoint: endpoint,
