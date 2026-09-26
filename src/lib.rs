@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, bail};
+use anyhow::{Context, anyhow, bail};
 pub use error::{Error, Result};
 use insecure::SkipServerVerification;
 use log::info;
@@ -49,7 +49,7 @@ impl Connection {
         let receivers = spawn_unreliable_receivers(endpoint.clone(), conn.clone())
             .into_iter()
             .enumerate()
-            .map(|(i, channel)| UnreliableReceiver::new(i, "<no label>", channel));
+            .map(|(i, channel)| UnreliableReceiver::new(i, String::new(), channel));
 
         Self {
             _endpoint: endpoint,
@@ -89,20 +89,27 @@ impl Connection {
         Ok((id, ReliableSender(sender), ReliableReceiver(receiver)))
     }
 
-    /// Creates an unreliable, bidirectional stream
+    /// Creates an unreliable, bidirectional stream with the given ID and label.
     pub async fn create_unreliable_stream(
         &mut self,
         id: u8,
-        label: &'static str,
+        label: impl Into<String>,
     ) -> anyhow::Result<(UnreliableSender, UnreliableReceiver)> {
+        let label = label.into();
+        // TODO: just pop a receiver
         info!("Creating unreliable stream with ID {id}");
         let mut receiver = self
             .unreliable_receivers
             .remove(&id)
             .ok_or_else(|| anyhow!("Unreliable stream ID {id} is already taken"))?;
-        receiver.label = label;
+        receiver.set_label(label.clone());
+        assert!(label.len() < u8::MAX as usize);
+        self.control_stream
+            .0
+            .write_all(&[id, label.len() as u8])
+            .await?;
+        self.control_stream.0.write_all(label.as_bytes()).await?;
         let sender = UnreliableSender::new(self._endpoint.clone(), self.conn.clone(), id, label);
-        self.control_stream.0.write(&[id]).await?;
         Ok((sender, receiver))
     }
 
@@ -114,19 +121,24 @@ impl Connection {
         if self.unreliable_receivers.is_empty() {
             return Err(anyhow!("All streams are taken"));
         }
-        let mut id = 0u8;
+        let mut header = [0u8; 2];
+        self.control_stream.1.read_exact(&mut header).await?;
+        let id = header[0];
+        let label_len = header[1] as usize;
+        let mut label_bytes = [0u8; u8::MAX as usize];
         self.control_stream
             .1
-            .read_exact(std::slice::from_mut(&mut id))
+            .read_exact(&mut label_bytes[..label_len])
             .await?;
+        let label = str::from_utf8(&label_bytes)
+            .context("Label of accepted unreliable stream is not utf8")?
+            .to_owned();
+
         match self.unreliable_receivers.remove(&id) {
-            Some(receiver) => {
-                let sender = UnreliableSender::new(
-                    self._endpoint.clone(),
-                    self.conn.clone(),
-                    id,
-                    "<unknown>",
-                );
+            Some(mut receiver) => {
+                receiver.set_label(label.clone());
+                let sender =
+                    UnreliableSender::new(self._endpoint.clone(), self.conn.clone(), id, label);
                 info!("Accepted unreliable stream with ID {id}");
                 return Ok((id, sender, receiver));
             }

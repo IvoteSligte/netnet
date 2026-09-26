@@ -56,7 +56,7 @@ impl Alloc {
 
 struct SendStatistics {
     stream_id: u8,
-    label: &'static str,
+    label: String,
     packets_in_last_second: Vec<(Instant, usize)>,
     fragments_per_second: fps_ticker::Fps,
     packets_per_second: fps_ticker::Fps,
@@ -64,7 +64,7 @@ struct SendStatistics {
 }
 
 impl SendStatistics {
-    pub fn new(stream_id: u8, label: &'static str) -> Self {
+    pub fn new(stream_id: u8, label: String) -> Self {
         Self {
             stream_id,
             label,
@@ -116,7 +116,7 @@ pub struct UnreliableSender {
     packet_index: u64,
     alloc_pool: Vec<Alloc>,
     stats: SendStatistics,
-    pub label: &'static str,
+    pub label: String,
 }
 
 impl UnreliableSender {
@@ -124,13 +124,13 @@ impl UnreliableSender {
         endpoint: quinn::Endpoint,
         conn: quinn::Connection,
         stream_id: u8,
-        label: &'static str,
+        label: String,
     ) -> Self {
         Self {
             _endpoint: endpoint,
             conn,
             stream_id,
-            label,
+            label: label.clone(),
             packet_index: 0,
             alloc_pool: Vec::with_capacity(100),
             stats: SendStatistics::new(stream_id, label),
@@ -235,7 +235,7 @@ pub enum RecvTimeoutError {
 
 struct RecvStatistics {
     stream_id: usize,
-    label: &'static str,
+    label: String,
     fragments_per_second: fps_ticker::Fps,
     packets_per_second: fps_ticker::Fps,
     packets_in_last_second: Vec<(Instant, usize)>,
@@ -244,7 +244,7 @@ struct RecvStatistics {
 }
 
 impl RecvStatistics {
-    pub fn new(stream_id: usize, label: &'static str) -> Self {
+    pub fn new(stream_id: usize, label: String) -> Self {
         Self {
             stream_id,
             label,
@@ -334,13 +334,13 @@ pub struct UnreliableReceiver {
     fragment_mask: Vec<bool>,
     num_fragments_found: u32,
     statistics: RecvStatistics,
-    pub label: &'static str,
+    label: String,
 }
 
 impl UnreliableReceiver {
     pub fn new(
         stream_id: usize,
-        label: &'static str,
+        label: String,
         channel: tokio::sync::mpsc::Receiver<Bytes>,
     ) -> Self {
         Self {
@@ -350,8 +350,17 @@ impl UnreliableReceiver {
             fragment_mask: Vec::with_capacity(100),
             num_fragments_found: 0,
             statistics: RecvStatistics::new(stream_id, label),
-            label: "",
+            label: String::new(),
         }
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn set_label(&mut self, label: String) {
+        self.label = label.clone();
+        self.statistics.label = label;
     }
 
     /// Returns `None` if the connection is closed
