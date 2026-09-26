@@ -219,8 +219,7 @@ impl UnreliableSender {
             self.packet_index,
             self.stats.packets_per_second()
         );
-        self.stats
-            .sent_packet(total_fragments as usize * HEADER_SIZE + bytes.len());
+        self.stats.sent_packet(bytes.len());
         Ok(())
     }
 
