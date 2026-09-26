@@ -92,16 +92,16 @@ impl Connection {
     /// Creates an unreliable, bidirectional stream with the given ID and label.
     pub async fn create_unreliable_stream(
         &mut self,
-        id: u8,
         label: impl Into<String>,
     ) -> anyhow::Result<(UnreliableSender, UnreliableReceiver)> {
         let label = label.into();
-        // TODO: just pop a receiver
-        info!("Creating unreliable stream with ID {id}");
-        let mut receiver = self
+        let id = *self
             .unreliable_receivers
-            .remove(&id)
-            .ok_or_else(|| anyhow!("Unreliable stream ID {id} is already taken"))?;
+            .keys()
+            .next()
+            .ok_or_else(|| anyhow!("All unreliable streams are taken"))?;
+        info!("Creating unreliable stream with ID {id}");
+        let mut receiver = self.unreliable_receivers.remove(&id).unwrap();
         receiver.set_label(label.clone());
         assert!(label.len() < u8::MAX as usize);
         self.control_stream
@@ -119,7 +119,7 @@ impl Connection {
     ) -> anyhow::Result<(u8, UnreliableSender, UnreliableReceiver)> {
         info!("Accepting unreliable stream");
         if self.unreliable_receivers.is_empty() {
-            return Err(anyhow!("All streams are taken"));
+            return Err(anyhow!("All unreliable streams are taken"));
         }
         let mut header = [0u8; 2];
         self.control_stream.1.read_exact(&mut header).await?;
