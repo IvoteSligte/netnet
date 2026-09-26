@@ -116,7 +116,7 @@ pub struct UnreliableSender {
     packet_index: u64,
     alloc_pool: Vec<Alloc>,
     stats: SendStatistics,
-    pub label: String,
+    label: String,
 }
 
 impl UnreliableSender {
@@ -222,6 +222,10 @@ impl UnreliableSender {
         self.stats
             .sent_packet(total_fragments as usize * HEADER_SIZE + bytes.len());
         Ok(())
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
     }
 }
 

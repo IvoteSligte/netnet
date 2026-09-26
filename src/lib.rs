@@ -36,7 +36,7 @@ pub struct Connection {
     _endpoint: quinn::Endpoint,
     conn: quinn::Connection,
     control_stream: QuinnStream,
-    reliable_stream_ids: HashSet<u8>,
+    reliable_stream_labels: HashSet<String>,
     unreliable_receivers: HashMap<u8, UnreliableReceiver>,
 }
 
@@ -55,38 +55,53 @@ impl Connection {
             _endpoint: endpoint,
             conn,
             control_stream,
-            reliable_stream_ids: HashSet::from_iter(0u8..u8::MAX),
+            reliable_stream_labels: HashSet::new(),
             unreliable_receivers: (0u8..).zip(receivers).collect(),
         }
     }
 
-    /// Creates a reliable, bidirectional stream
+    /// Creates a reliable, bidirectional stream with the given unique label.
     pub async fn create_reliable_stream(
         &mut self,
-        id: u8,
+        label: impl Into<String>,
     ) -> anyhow::Result<(ReliableSender, ReliableReceiver)> {
-        info!("Creating reliable stream with ID {id}");
-        if !self.reliable_stream_ids.remove(&id) {
-            return Err(anyhow!("Reliable stream ID {id} is already taken"));
+        let label = label.into();
+        info!("Creating reliable stream with label '{label}'");
+        if !self.reliable_stream_labels.insert(label.clone()) {
+            return Err(anyhow!("Reliable stream label '{label}' is already in use"));
         }
+        assert!(label.len() <= u8::MAX as usize);
         let (mut sender, receiver) = self.conn.open_bi().await?;
-        sender.write(std::slice::from_ref(&id)).await?;
-        Ok((ReliableSender(sender), ReliableReceiver(receiver)))
+        sender.write(&[label.len() as u8]).await?;
+        sender.write_all(label.as_bytes()).await?;
+
+        let sender = ReliableSender::new(sender, label.clone());
+        let receiver = ReliableReceiver::new(receiver, label.clone());
+        Ok((sender, receiver))
     }
 
-    /// Returns stream ID and the stream sender/receiver pair
+    /// Returns the stream sender/receiver pair.
+    /// Use [ReliableSender::label] or [ReliableReceiver::label] to access the stream's label.
     pub async fn accept_reliable_stream(
         &mut self,
-    ) -> anyhow::Result<(u8, ReliableSender, ReliableReceiver)> {
+    ) -> anyhow::Result<(ReliableSender, ReliableReceiver)> {
         info!("Accepting reliable stream");
-        if self.reliable_stream_ids.is_empty() {
-            return Err(anyhow!("All streams are taken"));
-        }
         let (sender, mut receiver) = self.conn.accept_bi().await?;
-        let mut id = 0u8;
-        receiver.read(std::slice::from_mut(&mut id)).await?;
-        info!("Accepted reliable stream with ID {id}");
-        Ok((id, ReliableSender(sender), ReliableReceiver(receiver)))
+        let mut label_len = 0u8;
+        receiver.read(std::slice::from_mut(&mut label_len)).await?;
+        let mut label_bytes = [0u8; u8::MAX as usize];
+        receiver
+            .read_exact(&mut label_bytes[..label_len as usize])
+            .await?;
+        let label = str::from_utf8(&label_bytes[..label_len as usize])
+            .context("Label of accepted reliable stream is not utf8")?
+            .to_owned();
+
+        info!("Accepted reliable stream with label '{label}'");
+        assert!(self.reliable_stream_labels.insert(label.clone()));
+        let sender = ReliableSender::new(sender, label.clone());
+        let receiver = ReliableReceiver::new(receiver, label);
+        Ok((sender, receiver))
     }
 
     /// Creates an unreliable, bidirectional stream with the given ID and label.
@@ -103,7 +118,7 @@ impl Connection {
         info!("Creating unreliable stream with ID {id}");
         let mut receiver = self.unreliable_receivers.remove(&id).unwrap();
         receiver.set_label(label.clone());
-        assert!(label.len() < u8::MAX as usize);
+        assert!(label.len() <= u8::MAX as usize);
         self.control_stream
             .0
             .write_all(&[id, label.len() as u8])
@@ -116,7 +131,7 @@ impl Connection {
     /// Returns stream ID and the stream sender/receiver pair
     pub async fn accept_unreliable_stream(
         &mut self,
-    ) -> anyhow::Result<(u8, UnreliableSender, UnreliableReceiver)> {
+    ) -> anyhow::Result<(UnreliableSender, UnreliableReceiver)> {
         info!("Accepting unreliable stream");
         if self.unreliable_receivers.is_empty() {
             return Err(anyhow!("All unreliable streams are taken"));
@@ -130,7 +145,7 @@ impl Connection {
             .1
             .read_exact(&mut label_bytes[..label_len])
             .await?;
-        let label = str::from_utf8(&label_bytes)
+        let label = str::from_utf8(&label_bytes[..label_len])
             .context("Label of accepted unreliable stream is not utf8")?
             .to_owned();
 
@@ -140,7 +155,7 @@ impl Connection {
                 let sender =
                     UnreliableSender::new(self._endpoint.clone(), self.conn.clone(), id, label);
                 info!("Accepted unreliable stream with ID {id}");
-                return Ok((id, sender, receiver));
+                return Ok((sender, receiver));
             }
             None => bail!("Accepted duplicate stream with ID {id}"),
         }
